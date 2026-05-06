@@ -1,0 +1,6 @@
+.DS_Store
+.repo_name
+.obsidian/
+.vscode/
+.idea/
+*.tmp
