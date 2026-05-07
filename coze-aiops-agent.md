@@ -842,3 +842,1573 @@ Coze 智能体：
 5. HTTPS
    代理服务必须配置 HTTPS，避免 AK/SK 在传输中被截获
 ```
+
+---
+
+## 9.2 用 Coze + Ansible 做自动化运维智能体
+
+### 整体架构
+
+```
+用户 → 企业微信/飞书 → Coze Bot → 插件(Ansible API) → Ansible → 目标主机
+
+流程：
+  用户说"重启 web 组的所有机器"
+  → Coze Bot 识别意图
+  → 工作流调用 Ansible 插件
+  → 插件调 Ansible API 服务
+  → Ansible 执行 playbook
+  → 结果原路返回
+```
+
+---
+
+### 9.2.1 准备工作
+
+#### 9.2.1.1 准备 Ansible 环境
+
+```bash
+# 1. 在能 SSH 到目标主机的机器上安装 Ansible
+# 建议用一台专门的跳板机或管理节点
+yum install -y epel-release && yum install -y ansible   # CentOS
+apt install -y ansible                                    # Ubuntu
+
+# 2. 配置免密 SSH
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/ansible_rsa -N ""
+ssh-copy-id -i ~/.ssh/ansible_rsa.pub root@10.0.1.10
+ssh-copy-id -i ~/.ssh/ansible_rsa.pub root@10.0.1.11
+# ... 对所有目标主机
+
+# 3. 配置 hosts 清单
+sudo mkdir -p /etc/ansible
+sudo tee /etc/ansible/hosts << 'EOF'
+[web]
+web-01 ansible_host=10.0.1.10
+web-02 ansible_host=10.0.1.11
+web-03 ansible_host=10.0.1.12
+
+[db]
+db-master ansible_host=10.0.2.10
+db-slave ansible_host=10.0.2.11
+
+[all:vars]
+ansible_user=root
+ansible_ssh_private_key_file=/root/.ssh/ansible_rsa
+EOF
+
+# 4. 验证
+ansible web -m ping
+# web-01 | SUCCESS => {"changed": false, "ping": "pong"}
+# web-02 | SUCCESS => {"changed": false, "ping": "pong"}
+# web-03 | SUCCESS => {"changed": false, "ping": "pong"}
+```
+
+#### 9.2.1.2 编写 Ansible API 服务脚本并开启 API
+
+```python
+# ansible_api_server.py
+# 用 Flask 将 Ansible 封装为 REST API，供 Coze 插件调用
+# 部署：gunicorn -w 4 -b 0.0.0.0:8867 ansible_api_server:app
+
+import subprocess
+import json
+import re
+import os
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+ANSIBLE_BIN = "/usr/bin/ansible"
+ANSIBLE_PLAYBOOK = "/usr/bin/ansible-playbook"
+PLAYBOOK_DIR = "/etc/ansible/playbooks"
+
+# 命令安全白名单
+ALLOWED_MODULES = {
+    "ping": {"safe": True},
+    "command": {"safe": True, "blocked": ["rm -rf", "mkfs", "dd if=", "> /dev/sd", "shutdown", "reboot", "init ", "iptables -F"]},
+    "shell": {"safe": True, "blocked": ["rm -rf", "mkfs", "dd if=", "> /dev/sd", "shutdown", "reboot", "init ", "iptables -F"]},
+    "copy": {"safe": True},
+    "script": {"safe": True},
+    "service": {"safe": True, "allowed": ["start", "stop", "restart", "status", "reload"]},
+    "systemd": {"safe": True},
+    "yum": {"safe": True, "allowed": ["state=installed", "state=latest", "state=absent"]},
+    "apt": {"safe": True, "allowed": ["state=installed", "state=latest", "state=absent"]},
+    "get_url": {"safe": True},
+    "uri": {"safe": True},
+    "setup": {"safe": True},
+    "cron": {"safe": True},
+}
+
+
+def check_command_safety(module: str, args: str) -> tuple:
+    """检查命令安全性"""
+    if module not in ALLOWED_MODULES:
+        return False, f"模块 {module} 不在白名单中"
+
+    mod_conf = ALLOWED_MODULES[module]
+    if not mod_conf["safe"]:
+        return False, f"模块 {module} 被禁用"
+
+    # 检查阻塞模式
+    if "blocked" in mod_conf:
+        for pattern in mod_conf["blocked"]:
+            if re.search(pattern, args, re.IGNORECASE):
+                return False, f"参数包含被禁止的模式: {pattern}"
+
+    # 对于 service/systemd 模块，检查 action 是否在允许列表
+    if "allowed" in mod_conf:
+        action = args.split()[-1] if args.split() else ""
+        if not any(a in args for a in mod_conf["allowed"]):
+            return False, f"操作不在允许列表中: {mod_conf['allowed']}"
+
+    return True, "OK"
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({"status": "ok", "ansible_version": subprocess.run([ANSIBLE_BIN, "--version"], capture_output=True, text=True).stdout.splitlines()[0]})
+
+
+@app.post("/api/ping")
+def ping():
+    """连通性检查"""
+    data = request.json or {}
+    group = data.get("group", "all")
+    result = subprocess.run(
+        [ANSIBLE_BIN, group, "-m", "ping", "-o"],
+        capture_output=True, text=True, timeout=30
+    )
+    hosts = []
+    for line in result.stdout.strip().split("\n"):
+        if "SUCCESS" in line:
+            host = line.split("|")[0].strip()
+            hosts.append({"host": host, "status": "reachable"})
+        elif "UNREACHABLE" in line:
+            host = line.split("|")[0].strip()
+            hosts.append({"host": host, "status": "unreachable"})
+    return jsonify({"success": result.returncode == 0, "hosts": hosts, "summary": f"{len([h for h in hosts if h['status']=='reachable'])}/{len(hosts)} 可达"})
+
+
+@app.post("/api/command")
+def run_command():
+    """在目标主机组执行命令"""
+    data = request.json or {}
+    group = data.get("group", "all")
+    module = data.get("module", "command")
+    args = data.get("args", "")
+    
+    # 安全检查
+    safe, reason = check_command_safety(module, args)
+    if not safe:
+        return jsonify({"success": False, "error": reason}), 403
+
+    result = subprocess.run(
+        [ANSIBLE_BIN, group, "-m", module, "-a", args, "-o"],
+        capture_output=True, text=True, timeout=60
+    )
+
+    outputs = []
+    for line in result.stdout.strip().split("\n"):
+        if "|" in line:
+            host = line.split("|")[0].strip()
+            status = "成功" if result.returncode == 0 else "失败"
+            outputs.append({"host": host, "result": status, "output": line})
+
+    return jsonify({"success": result.returncode == 0, "outputs": outputs})
+
+
+@app.post("/api/facts")
+def get_facts():
+    """获取主机详细信息"""
+    data = request.json or {}
+    group = data.get("group", "all")
+    result = subprocess.run(
+        [ANSIBLE_BIN, group, "-m", "setup", "-o"],
+        capture_output=True, text=True, timeout=30
+    )
+    facts = []
+    for line in result.stdout.strip().split("\n"):
+        if "|" in line and "SUCCESS" in line:
+            host = line.split("|")[0].strip()
+            json_str = line.split("|", 2)[-1].strip()
+            try:
+                fact = json.loads(json_str)
+                facts.append({
+                    "host": host,
+                    "os": fact.get("ansible_distribution", "") + " " + fact.get("ansible_distribution_version", ""),
+                    "cpu": fact.get("ansible_processor_vcpus", 0),
+                    "memory": round(int(fact.get("ansible_memtotal_mb", 0)) / 1024, 1),
+                    "disk": fact.get("ansible_devices", {}).keys(),
+                    "ip": fact.get("ansible_default_ipv4", {}).get("address", ""),
+                })
+            except json.JSONDecodeError:
+                pass
+    return jsonify({"hosts": facts})
+
+
+@app.post("/api/playbook")
+def run_playbook():
+    """执行 playbook"""
+    data = request.json or {}
+    playbook_name = data.get("playbook")
+    group = data.get("group")
+    extra_vars = data.get("extra_vars", {})
+
+    playbook_path = os.path.join(PLAYBOOK_DIR, playbook_name)
+    if not os.path.exists(playbook_path):
+        return jsonify({"success": False, "error": f"Playbook {playbook_name} 不存在"}), 404
+
+    cmd = [ANSIBLE_PLAYBOOK, playbook_path]
+    if group:
+        cmd.extend(["-l", group])
+    for k, v in extra_vars.items():
+        cmd.extend(["-e", f"{k}={v}"])
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    return jsonify({
+        "success": result.returncode == 0,
+        "stdout": result.stdout[-3000:],
+    })
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8867)
+```
+
+```bash
+# 部署 API 服务
+pip install flask gunicorn
+gunicorn -w 4 -b 0.0.0.0:8867 ansible_api_server:app --daemon \
+  --access-logfile /var/log/ansible-api-access.log \
+  --error-logfile /var/log/ansible-api-error.log
+
+# 验证
+curl -X POST http://localhost:8867/api/ping \
+  -H "Content-Type: application/json" \
+  -d '{"group": "web"}'
+```
+
+#### 9.2.1.3 编写 Playbook
+
+```yaml
+# /etc/ansible/playbooks/restart_service.yaml
+- name: 安全重启服务
+  hosts: "{{ target_group | default('all') }}"
+  gather_facts: no
+  tasks:
+    - name: 检查服务是否存在
+      systemd:
+        name: "{{ service_name }}"
+      register: svc_check
+      ignore_errors: yes
+
+    - name: 重启服务
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+      when: svc_check.status.ActiveState is defined
+      register: restart_result
+
+    - name: 等待服务就绪
+      wait_for:
+        port: "{{ health_port | default(80) }}"
+        timeout: 30
+      when: health_port is defined
+```
+
+```yaml
+# /etc/ansible/playbooks/check_disk.yaml
+- name: 磁盘巡检
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: 检查磁盘使用率
+      shell: "df -h / | tail -1 | awk '{print $5}'"
+      register: disk_usage
+
+    - name: 检查 inode 使用率
+      shell: "df -i / | tail -1 | awk '{print $5}'"
+      register: inode_usage
+
+    - name: 告警
+      debug:
+        msg: "警告：{{ inventory_hostname }} 磁盘使用率 {{ disk_usage.stdout }}"
+      when: "disk_usage.stdout | replace('%', '') | int > 80"
+```
+
+```yaml
+# /etc/ansible/playbooks/collect_logs.yaml
+- name: 收集指定时间段日志
+  hosts: "{{ target_group }}"
+  gather_facts: no
+  tasks:
+    - name: 打包日志
+      archive:
+        path: "/var/log/{{ app_name }}/"
+        dest: "/tmp/{{ app_name }}-logs-{{ ansible_date_time.date }}.tar.gz"
+        format: gz
+
+    - name: 拉取到管理节点
+      fetch:
+        src: "/tmp/{{ app_name }}-logs-{{ ansible_date_time.date }}.tar.gz"
+        dest: "/tmp/collected-logs/{{ inventory_hostname }}/"
+        flat: yes
+```
+
+---
+
+### 9.2.2 创建 Coze 插件
+
+基于 Ansible API 服务创建 5 个插件：
+
+#### 插件 1：ansible-ping
+
+```
+Coze 插件 → 基于 API 创建
+  名称：ansible-ping
+  描述：检查目标主机组的 SSH 连通性
+  URL：https://your-ansible-api/api/ping
+  方法：POST
+  参数：group(String, 非必填, 默认all)
+
+输出：
+  {"success": true, "hosts": [...], "summary": "3/3 可达"}
+```
+
+#### 插件 2：ansible-run-command
+
+```
+Coze 插件 → 基于 API 创建
+  名称：ansible-run-command
+  描述：在目标主机上执行命令（df、free、ps、ss 等安全命令）
+  URL：https://your-ansible-api/api/command
+  方法：POST
+  参数：
+    group(String, 必填)：目标主机组（web/db/all）
+    module(String, 必填)：Ansible 模块（command/shell/systemd/service）
+    args(String, 必填)：模块参数（如 "df -h"）
+
+输出：
+  {"success": true, "outputs": [{"host":"web-01", "result":"成功", "output":"..."}]}
+```
+
+#### 插件 3：ansible-facts
+
+```
+Coze 插件 → 基于 API 创建
+  名称：ansible-facts
+  描述：获取主机详细配置信息（OS/CPU/内存/磁盘/IP）
+  URL：https://your-ansible-api/api/facts
+  方法：POST
+  参数：group(String, 非必填)
+```
+
+#### 插件 4：ansible-restart-service
+
+```
+Coze 插件 → 基于 API 创建
+  名称：ansible-restart-service
+  描述：安全重启指定服务（先检查、后重启、再验证）
+  URL：https://your-ansible-api/api/playbook
+  方法：POST
+  参数：
+    group(String, 必填)
+    service_name(String, 必填)
+    health_port(Integer, 非必填)
+```
+
+#### 插件 5：ansible-check-disk
+
+```
+Coze 插件 → 基于 API 创建
+  名称：ansible-check-disk
+  描述：磁盘巡检（检查使用率和 inode）
+  URL：https://your-ansible-api/api/playbook
+  方法：POST
+  参数：
+    playbook(String, 固定 check_disk.yaml)
+    group(String, 默认 all)
+```
+
+---
+
+### 9.2.3 创建 Coze 工作流
+
+#### 工作流1：智能磁盘清理
+
+```
+工作流名称：smart-disk-cleanup
+
+触发条件：用户说"磁盘满了" / "清理磁盘" / "磁盘巡检"
+
+节点流程：
+┌─────────────┐
+│  开始        │
+│  提取：用户   │
+│  指定的主机组 │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 1.磁盘巡检   │
+│ ansible-     │
+│ check-disk   │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 2.LLM分析    │
+│ 判断哪些机器  │
+│ 磁盘>80%     │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 3.条件分支    │
+│ >80%且>1台   │→ 走清理流程
+│ 全部正常     │→ 回复"磁盘正常"
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 4.查大文件   │
+│ ansible-     │
+│ run-command  │
+│ du -sh /* │  │
+│ sort -rh     │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 5.LLM分析    │
+│ 识别可清理的  │
+│ 日志/缓存/    │
+│ 临时文件      │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 6.用户确认    │
+│ 展示清理计划  │
+│ [确认][取消]  │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 7.执行清理   │
+│ ansible-     │
+│ run-command  │
+│ 安全清理命令  │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 8.验证       │
+│ 再次查磁盘   │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ 9.LLM 汇总   │
+│ 清理前后对比  │
+│ + 防止再满建议│
+└──────┬──────┘
+       ↓
+      结束
+```
+
+#### 工作流2：服务自动重启
+
+```
+工作流名称：safe-restart-service
+
+节点流程：
+┌──────────────┐
+│ 开始          │
+│ 提取：服务名   │
+│ 提取：目标组   │
+└──────┬───────┘
+       ↓
+┌──────────────┐
+│ 1.服务状态    │
+│ ansible-run   │
+│ systemctl     │
+│ status xxx    │
+└──────┬───────┘
+       ↓
+┌──────────────┐
+│ 2.依赖检查    │
+│ 查数据库连接数 │
+│ 查上游服务状态 │
+└──────┬───────┘
+       ↓
+┌──────────────┐
+│ 3.LLM判断     │
+│ 安全吗？      │
+│ 依赖正常？    │
+└──────┬───────┘
+       ↓
+     ┌─┴──────────────────┐
+     ↓                     ↓
+  安全                   有风险
+┌──────────────┐  ┌──────────────┐
+│ 4.确认重启    │  │ 4b.警告+额外  │
+│ [确认][取消]  │  │ 确认         │
+└──────┬───────┘  └──────┬───────┘
+       ↓                 ↓
+┌──────────────┐
+│ 5.执行重启    │
+│ ansible       │
+│ restart-      │
+│ service       │
+└──────┬───────┘
+       ↓
+┌──────────────┐
+│ 6.验证恢复    │
+│ 等端口就绪    │
+│ 查进程存活    │
+└──────┬───────┘
+       ↓
+┌──────────────┐
+│ 7.通知        │
+│ 重启结果 +    │
+│ 建议          │
+└──────────────┘
+```
+
+---
+
+### 9.2.4 配置 Coze 智能体
+
+```
+Bot: AIOps-Ansible 运维助手
+
+System Prompt:
+  你是运维自动化助手，通过 Ansible 管理服务器。
+  
+  能力：
+  - 查询任意主机组连通性
+  - 获取主机配置信息（CPU/内存/磁盘/OS）
+  - 在主机上执行安全命令（df/free/ps/systemctl 等）
+  - 安全重启服务（自动检查依赖+确认+验证）
+  - 磁盘巡检与智能清理
+  
+  安全原则：
+  - 变更操作必须用户确认
+  - 仅执行白名单内的安全命令
+  - 操作前评估影响范围
+
+绑定插件：
+  ├── ansible-ping
+  ├── ansible-run-command
+  ├── ansible-facts
+  ├── ansible-restart-service
+  └── ansible-check-disk
+
+绑定工作流：
+  ├── smart-disk-cleanup
+  └── safe-restart-service
+
+快捷指令：
+  /ping <组名>       → 连通性检查
+  /info <组名>       → 主机详情
+  /disk <组名>       → 磁盘巡检
+  /restart <服务名>  → 安全重启
+```
+
+---
+
+## 9.3 用 Dify + JumpServer 做运维智能体
+
+### 为什么 Dify + JumpServer
+
+JumpServer 是开源堡垒机，负责**安全审计和权限控制**；Dify 负责**智能编排**。两个加起来：
+
+```
+JumpServer 提供：安全登录 + 操作审计 + 权限控制
+Dify 提供：自然语言理解 + 工作流编排 + LLM 推理
+
+组合后：
+  用户说 "重启 web-01 上的 nginx"
+  → Dify 解析意图 → JumpServer MCP 执行操作
+  → JumpServer 审计录像
+  → Dify 返回结果
+```
+
+---
+
+### 9.3.1 部署 JumpServer
+
+#### 9.3.1.1 部署 JumpServer
+
+```bash
+# 官方一键部署脚本（推荐）
+curl -sSL https://github.com/jumpserver/jumpserver/releases/latest/download/quick_start.sh | bash
+
+# 安装完成后访问
+# Web: http://<服务器IP>:80
+# 默认账号: admin
+# 默认密码: admin （首次登录强制修改）
+
+# 或者使用 Docker 部署
+git clone https://github.com/jumpserver/Dockerfile.git /opt/jumpserver-docker
+cd /opt/jumpserver-docker
+cp config_example.conf .env
+# 编辑 .env，修改密码和密钥
+docker-compose up -d
+```
+
+```bash
+# 关键配置项 (.env)
+SECRET_KEY=$(openssl rand -hex 32)
+BOOTSTRAP_TOKEN=$(openssl rand -hex 16)
+DB_PASSWORD=$(openssl rand -hex 16)
+REDIS_PASSWORD=$(openssl rand -hex 16)
+
+# Web 端口
+HTTP_PORT=80
+SSH_PORT=2222
+
+# 邮箱配置（告警用）
+EMAIL_HOST=smtp.example.com
+EMAIL_PORT=587
+EMAIL_HOST_USER=ops@example.com
+EMAIL_HOST_PASSWORD=***
+```
+
+#### 9.3.1.2 快速体验 JumpServer
+
+```
+JumpServer 核心概念：
+  ├── 资产管理：添加你要管理的 Linux/Windows/数据库/网络设备
+  ├── 用户管理：谁可以登录 JumpServer
+  ├── 资产授权：谁可以访问哪些资产（权限最小化）
+  └── 审计录像：所有操作都有录屏回放
+
+快速上手：
+  1. 资产管理 → 创建资产 → 填 IP + SSH 端口 + 凭据
+  2. 用户管理 → 创建用户 → 分配资产权限
+  3. Web 终端 → 选择资产 → 直接 SSH 登录
+  4. 审计台 → 查看操作录像
+```
+
+```
+JumpServer 三种连接模式：
+
+1. Web 终端（默认）：浏览器内直接 SSH，无需客户端
+2. Web SFTP：浏览器内传输文件
+3. 数据库连接：支持 MySQL/PostgreSQL/Redis 等 Web 终端
+
+对于 AI 智能体，主要用 API 方式 —— 通过 JumpServer MCP 程序化调用
+```
+
+---
+
+### 9.3.2 部署 JumpServer MCP
+
+JumpServer MCP 是一个中间层，将 JumpServer 的资产管理能力暴露为 MCP 协议，供 Dify 调用。
+
+#### 9.3.2.1 获取用户 Token
+
+```bash
+# 在 JumpServer 管理后台获取 API Key
+# 右上角头像 → 个人信息 → API Key → 生成
+# 或者用命令行获取
+curl -X POST http://<jumpserver-ip>/api/v1/authentication/auth/ \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "your-password"}'
+
+# 返回:
+# {"token": "abc123...", "user": {...}}
+
+# 记录这个 Token 用于 MCP 配置
+```
+
+#### 9.3.2.2 部署 JumpServer MCP
+
+```bash
+git clone https://github.com/wojiushixiaobai/jumpserver-mcp.git /opt/jumpserver-mcp
+cd /opt/jumpserver-mcp
+pip install -r requirements.txt
+```
+
+```bash
+# config.yaml
+jumpserver:
+  url: "http://<jumpserver-ip>"        # JumpServer 地址
+  token: "abc123..."                    # 上一步获取的 Token
+
+mcp:
+  server_name: "jumpserver-mcp"
+  port: 8870
+  transport: "sse"                      # SSE 模式（Dify 兼容）
+```
+
+```bash
+# 启动
+python server.py
+# 或者后台运行
+nohup python server.py > /var/log/jumpserver-mcp.log 2>&1 &
+```
+
+**MCP Server 暴露的工具列表**：
+
+```
+暴露的工具（供 Dify 调用）：
+├── list_assets          → 列出所有资产（主机/数据库）
+├── get_asset_info       → 获取单个资产详情
+├── connect_asset        → 通过 JumpServer 连接到资产并执行命令
+├── list_users           → 列出所有用户
+├── get_session_records  → 获取操作审计记录
+├── upload_file          → 通过 JumpServer 上传文件
+└── download_file        → 通过 JumpServer 下载文件
+```
+
+#### 9.3.2.3 到 Dify 上添加 JumpServer MCP
+
+```
+Dify 控制台 → 工具 → MCP → 添加 MCP Server
+
+配置：
+  名称：JumpServer
+  传输协议：SSE
+  URL：http://<jumpserver-mcp-ip>:8870/sse
+
+添加后 Dify 会自动发现 MCP Server 提供的所有工具
+在 Agent 应用中就可以勾选使用这些工具了
+```
+
+---
+
+### 9.3.3 实现一个简单的需求
+
+#### 9.3.3.1 创建 Dify 应用
+
+```
+Dify → 创建应用 → Agent 类型
+
+第 1 步：基本信息
+  应用名称：JumpServer 运维助手
+  模型：Qwen3-8B（或你部署的模型）
+
+第 2 步：添加工具
+  Agent 设置 → 工具 → 添加
+  勾选 JumpServer MCP 的工具：
+    ☑ list_assets
+    ☑ get_asset_info
+    ☑ connect_asset
+  
+第 3 步：配置 System Prompt
+```
+
+```markdown
+你是 JumpServer 运维助手，通过堡垒机安全管理所有资产。
+
+## 你的能力
+1. 查询所有资产列表和状态
+2. 查看单个资产的详细信息
+3. 在资产上执行命令（所有操作经过 JumpServer 审计）
+4. 查看操作审计记录
+
+## 安全规则
+- 执行命令前，如果命令涉及变更操作（restart/stop/reboot/rm），必须先向用户确认
+- 所有操作自动由 JumpServer 录屏审计
+
+## 回答格式
+- 资产列表 → 表格
+- 执行命令 → 显示命令 + 输出 + 审计链接
+```
+
+#### 9.3.3.2 测试 Dify 应用
+
+```
+用户：帮我看看有哪些资产
+
+Bot：（调 list_assets）
+
+| 名称 | 类型 | 地址 | 状态 |
+|------|------|------|------|
+| web-01 | Linux | 10.0.1.10 | ✅ 活跃 |
+| web-02 | Linux | 10.0.1.11 | ✅ 活跃 |
+| db-master | Linux | 10.0.2.10 | ✅ 活跃 |
+| db-slave | Linux | 10.0.2.11 | ⚠️ 离线 |
+
+---
+用户：在 web-01 上帮我查一下磁盘使用情况
+
+Bot：
+（调 connect_asset 执行 df -h）
+  JumpServer 审计 ID: #20240507-001
+
+| 文件系统 | 总量 | 已用 | 可用 | 使用率 |
+|----------|------|------|------|--------|
+| /dev/vda1 | 40G | 18G | 22G | 45% |
+
+---
+用户：在 web-01 上重启 nginx
+
+Bot：
+⚠️ 即将在 web-01(10.0.1.10) 上重启 nginx
+此操作会短暂影响服务，是否继续？
+[确认] [取消]
+
+用户：确认
+
+Bot：
+✅ nginx 重启成功
+  执行命令: systemctl restart nginx
+  审计 ID: #20240507-002
+  操作人: 张三
+  [查看审计录像]
+```
+
+---
+
+### 9.3.4 做一个综合性应用智能体
+
+#### 场景：智能扩容决策 + 执行
+
+```
+用户：web 组 CPU 平均 85% 持续 30 分钟了，帮我扩容
+
+智能体执行流程：
+┌─────────────────────┐
+│ 1. 查资产现状         │
+│ JumpServer: list_    │
+│ assets → 当前 3 台   │
+└──────────┬──────────┘
+           ↓
+┌─────────────────────┐
+│ 2. 查资源现状         │
+│ JumpServer: connect  │
+│ → top/free/df        │
+│ 3台 CPU 均在 85%+    │
+└──────────┬──────────┘
+           ↓
+┌─────────────────────┐
+│ 3. 查历史容量数据     │
+│ 知识库: 检索历史      │
+│ 流量高峰时的容量需求   │
+└──────────┬──────────┘
+           ↓
+┌─────────────────────┐
+│ 4. LLM 决策          │
+│ 综合 CPU + 内存 +    │
+│ 历史数据 → 建议      │
+│ 扩容 2 台 4C8G       │
+└──────────┬──────────┘
+           ↓
+┌─────────────────────┐
+│ 5. 用户确认           │
+│ [确认扩容][详细分析]  │
+└──────────┬──────────┘
+           ↓
+┌─────────────────────┐
+│ 6. 执行扩容           │
+│ (对接云API或K8s)      │
+│ 新增 2 台 → 加入LB   │
+└──────────┬──────────┘
+           ↓
+┌─────────────────────┐
+│ 7. 验证 + 通知        │
+│ 检查新增机器健康      │
+│ 通知运维群 + 创建     │
+│ 变更工单              │
+└─────────────────────┘
+```
+
+**关键**：JumpServer 保证了每一步操作都有审计录像，Dify 保证了智能编排。这个组合对于需要合规审计的企业运维场景非常合适。
+
+---
+
+## 9.4 用 Dify + K8s 做运维智能体
+
+### 架构
+
+```
+用户 → Dify Agent → K8s MCP Server → kubectl → K8s 集群
+```
+
+### 部署 K8s MCP Server
+
+```bash
+git clone https://github.com/your-org/k8s-mcp-server.git /opt/k8s-mcp
+cd /opt/k8s-mcp
+pip install kubernetes mcp
+```
+
+```python
+# k8s_mcp_server.py
+from mcp.server.fastmcp import FastMCP
+from kubernetes import client, config
+import json
+
+mcp = FastMCP("k8s-ops")
+config.load_kube_config()  # 或 config.load_incluster_config() 集群内
+v1 = client.CoreV1Api()
+apps_v1 = client.AppsV1Api()
+
+@mcp.tool()
+def list_namespaces() -> list:
+    """列出所有命名空间"""
+    ns_list = v1.list_namespace()
+    return [{"name": ns.metadata.name, "status": ns.status.phase} for ns in ns_list.items]
+
+@mcp.tool()
+def list_pods(namespace: str = "default") -> list:
+    """列出指定命名空间的 Pod"""
+    pods = v1.list_namespaced_pod(namespace)
+    return [{
+        "name": p.metadata.name,
+        "status": p.status.phase,
+        "node": p.spec.node_name,
+        "restarts": sum(c.restart_count for c in p.status.container_statuses or []),
+        "age": str(p.status.start_time),
+    } for p in pods.items]
+
+@mcp.tool()
+def describe_pod(name: str, namespace: str = "default") -> dict:
+    """查看 Pod 详情"""
+    pod = v1.read_namespaced_pod(name, namespace)
+    return {
+        "name": pod.metadata.name,
+        "status": pod.status.phase,
+        "conditions": [{"type": c.type, "status": c.status} for c in pod.status.conditions or []],
+        "containers": [{"name": c.name, "image": c.image} for c in pod.spec.containers],
+        "events": [{"reason": e.reason, "message": e.message} for e in pod.status.container_statuses or []],
+    }
+
+@mcp.tool()
+def get_pod_logs(name: str, namespace: str = "default", tail: int = 100) -> str:
+    """获取 Pod 日志"""
+    return v1.read_namespaced_pod_log(name, namespace, tail_lines=tail)
+
+@mcp.tool()
+def list_deployments(namespace: str = "default") -> list:
+    """列出 Deployment"""
+    deps = apps_v1.list_namespaced_deployment(namespace)
+    return [{
+        "name": d.metadata.name,
+        "replicas": f"{d.status.ready_replicas or 0}/{d.spec.replicas}",
+        "image": d.spec.template.spec.containers[0].image,
+    } for d in deps.items]
+
+@mcp.tool()
+def scale_deployment(name: str, namespace: str, replicas: int) -> dict:
+    """扩缩容 Deployment（需要确认）"""
+    dep = apps_v1.read_namespaced_deployment(name, namespace)
+    dep.spec.replicas = replicas
+    apps_v1.patch_namespaced_deployment(name, namespace, dep)
+    return {"success": True, "name": name, "new_replicas": replicas}
+
+@mcp.tool()
+def get_events(namespace: str = "default") -> list:
+    """查看命名空间事件"""
+    events = v1.list_namespaced_event(namespace)
+    return [{"type": e.type, "reason": e.reason, "message": e.message, "time": str(e.last_timestamp)} for e in events.items]
+
+@mcp.tool()
+def get_nodes() -> list:
+    """查看集群节点状态"""
+    nodes = v1.list_node()
+    return [{
+        "name": n.metadata.name,
+        "status": [c.status for c in n.status.conditions if c.type == "Ready"][0],
+        "cpu": n.status.capacity.get("cpu", ""),
+        "memory": n.status.capacity.get("memory", ""),
+    } for n in nodes.items]
+
+mcp.run(transport="sse", port=8871)
+```
+
+```bash
+# 启动
+python k8s_mcp_server.py &
+```
+
+### Dify 配置
+
+```
+Dify → 工具 → MCP → 添加
+  名称：K8s-Ops
+  URL：http://<k8s-mcp-ip>:8871/sse
+  传输：SSE
+
+Dify → Agent 应用 → 绑定 K8s MCP 工具
+```
+
+### 对话示例
+
+```
+用户：prod 命名空间有哪些异常的 Pod
+
+Bot：
+(Normal Pods omitted)
+异常 Pod：
+
+🔴 api-gateway-9x2h — CrashLoopBackOff (重启 128 次)
+🔴 worker-cron-5h3k   — OOMKilled (重启 3 次)
+
+需要我深入排查吗？
+
+---
+用户：查 api-gateway
+
+Bot：（调 describe_pod + get_pod_logs）
+根因：连接 Redis 超时。Redis Service Endpoint 为空。
+建议：检查 Redis Pod 状态。
+```
+
+---
+
+## 9.5 用 Dify + Prometheus + Alertmanager 做运维智能体
+
+### 架构
+
+```
+Prometheus → 持续采集指标
+Alertmanager → 触发告警 → webhook 推给 Dify
+Dify Agent → 接收告警 → 自动排查 → 返回诊断结果
+```
+
+### Alertmanager Webhook 配置
+
+```yaml
+# alertmanager.yml
+receivers:
+  - name: 'dify-aiops'
+    webhook_configs:
+      - url: 'http://<dify-ip>/v1/workflows/run'
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials: 'Bearer app-xxxx'
+        max_alerts: 5
+```
+
+### Dify 告警分析工作流
+
+```
+工作流名：alert-analyzer
+
+触发：外部 API 调用（Alertmanager webhook）
+
+节点：
+┌──────────────────┐
+│ 开始              │
+│ 接收告警 JSON     │
+│ alertname,       │
+│ severity,        │
+│ description,     │
+│ labels           │
+└────────┬─────────┘
+         ↓
+┌──────────────────┐
+│ 1. 告警分级        │
+│ P0 → 立即处理      │
+│ P1 → 15分钟内      │
+│ P2 → 标记观察      │
+└────────┬─────────┘
+         ↓
+┌──────────────────┐
+│ 2. 查 Prometheus  │
+│ HTTP 请求节点     │
+│ 查相关指标趋势    │
+└────────┬─────────┘
+         ↓
+┌──────────────────┐
+│ 3. 查知识库       │
+│ 检索历史相似告警  │
+│ 和解决方案        │
+└────────┬─────────┘
+         ↓
+┌──────────────────┐
+│ 4. LLM 诊断       │
+│ 综合：当前告警 +  │
+│ 历史数据 + 指标   │
+│ 输出：根因 + 建议 │
+└────────┬─────────┘
+         ↓
+      ┌──┴──────────┐
+      ↓               ↓
+  严重/紧急        普通
+┌──────────┐  ┌──────────┐
+│5a.立即推送 │  │5b.汇总到  │
+│飞书/企微   │  │日报      │
+│+ @值班人   │  │          │
+└──────────┘  └──────────┘
+```
+
+### Dify Prompt 配置
+
+```markdown
+你是在线故障诊断专家。收到 Alertmanager 告警后请：
+
+1. 分析告警严重程度和影响范围
+2. 查询 Prometheus 获取相关指标趋势
+3. 检索知识库找到相似历史告警
+4. 给出根因分析和处理建议
+
+告警信息：
+{{alert_info}}
+
+Prometheus 查询结果：
+{{prometheus_result}}
+
+相似历史告警：
+{{knowledge_base_result}}
+
+请按以下格式输出：
+## 告警分析
+- 严重程度：...
+- 影响范围：...
+- 可能根因：...（概率排序）
+
+## 处理建议
+1. 紧急措施：...
+2. 排查步骤：...
+3. 预防措施：...
+```
+
+---
+
+## 9.6 用 n8n + Prometheus + Alertmanager 做运维智能体
+
+### 为什么 n8n
+
+n8n 是一个开源的工作流自动化工具，适合低代码编排。相比 Dify，它在**定时任务、条件分支、多系统串联**上更强。
+
+```
+n8n 优势：
+  ├── 可视化拖拽工作流
+  ├── 400+ 内置集成节点（Prometheus / Slack / Email / HTTP / DB）
+  ├── 定时触发 + Webhook 触发
+  ├── 条件分支/循环/错误处理
+  └── 开源自部署，数据不出域
+```
+
+### 部署 n8n
+
+```bash
+# Docker 部署
+docker run -d --name n8n \
+  -p 5678:5678 \
+  -v n8n_data:/home/node/.n8n \
+  -e N8N_SECURE_COOKIE=false \
+  n8nio/n8n
+
+# 访问 http://localhost:5678
+```
+
+### 创建告警处理工作流
+
+#### 工作流结构
+
+```
+Webhook (接收 Alertmanager 告警)
+    ↓
+解析告警 JSON
+    ↓
+条件判断（告警级别）
+    ├── critical → Slack 通知 + 创建 PagerDuty 事件
+    ├── warning  → 查询 Prometheus 趋势 → 判断是否升级
+    └── info     → 记录到数据库
+                   ↓
+              汇总到日报
+```
+
+#### 节点配置
+
+**节点 1：Webhook 触发器**
+
+```
+方式：POST
+路径：/alert-webhook
+响应模式：立即返回
+```
+
+**节点 2：解析 JSON**
+
+```
+类型：Function 节点
+代码：
+  const alert = items[0].json;
+  const severity = alert.commonLabels?.severity || 'info';
+  const alertname = alert.commonLabels?.alertname || 'unknown';
+  return [{
+    json: {
+      alertname,
+      severity,
+      description: alert.commonAnnotations?.description,
+      instance: alert.commonLabels?.instance,
+      value: alert.commonAnnotations?.value,
+    }
+  }];
+```
+
+**节点 3：条件分支（IF 节点）**
+
+```
+条件1：severity == 'critical' → 紧急处理流程
+条件2：severity == 'warning'  → 趋势分析流程
+条件3：severity == 'info'     → 记录日志
+```
+
+**节点 4：Prometheus 查询（HTTP Request 节点）**
+
+```
+方法：GET
+URL：http://prometheus:9090/api/v1/query
+参数：query=rate(http_requests_total{job="{{$node['解析JSON'].json['alertname']}}"}[5m])
+```
+
+**节点 5：LLM 分析**
+
+```
+类型：HTTP Request（调 LLM API）
+或使用 n8n 的 OpenAI 节点
+
+Prompt：
+  告警：{{$json.description}}
+  Prometheus 数据：{{$node['查Prometheus'].json}}
+  请分析告警原因并给出处理建议。
+```
+
+**节点 6：通知（Slack / 钉钉 / 飞书）**
+
+```
+类型：Slack 节点 或 HTTP Request
+内容：
+  🚨 {{severity == 'critical' ? '紧急' : ''}}告警
+  告警名称：{{alertname}}
+  实例：{{instance}}
+  描述：{{description}}
+  分析：{{$node['LLM分析'].json.analysis}}
+```
+
+### 定时巡检工作流
+
+```
+Cron 触发器（每 4 小时）
+    ↓
+HTTP Request: Prometheus 查询
+  - CPU > 80% 的节点
+  - 内存 > 85% 的节点
+  - 磁盘 > 80% 的节点
+    ↓
+IF 判断：是否有异常
+    ├── 有 → LLM 生成巡检报告 → 推送
+    └── 无 → 记录"一切正常"
+```
+
+```
+n8n vs Dify 选型：
+
+n8n 更适合：
+  - 定时任务密集型（巡检/日报/周报）
+  - 需要条件分支和错误重试
+  - 多外部系统串联（Prometheus→Jira→Slack）
+  - 非 AI 核心的自动化流程
+
+Dify 更适合：
+  - AI 推理密集型（告警分析/故障诊断）
+  - 需要 RAG 知识库检索
+  - 自然语言驱动的交互
+  - Agent 自主决策
+
+实践中通常两者配合：
+  n8n 负责触发+串联+通知 → 调 Dify API 做 AI 推理
+```
+
+---
+
+## 9.7 用 Dify + Ansible MCP 做运维智能体
+
+和 9.2 的 Coze+Ansible 方案类似，但用 Dify 替代 Coze，用 MCP 替代自定义 API。
+
+### 部署 Ansible MCP Server
+
+```bash
+git clone https://github.com/your-org/ansible-mcp.git /opt/ansible-mcp
+pip install mcp ansible-runner
+```
+
+```python
+# ansible_mcp_server.py
+from mcp.server.fastmcp import FastMCP
+import ansible_runner
+import json
+
+mcp = FastMCP("ansible-ops")
+
+INVENTORY = "/etc/ansible/hosts"
+
+@mcp.tool()
+def ping_hosts(group: str = "all") -> dict:
+    """检查主机连通性"""
+    r = ansible_runner.run(
+        private_data_dir="/tmp/ansible",
+        host_pattern=group,
+        module="ping",
+        inventory=INVENTORY,
+        quiet=True,
+    )
+    return {"reachable": r.stats["ok"], "unreachable": r.stats["failures"]}
+
+@mcp.tool()
+def run_shell(group: str, command: str) -> dict:
+    """在主机组执行安全 shell 命令"""
+    # 安全过滤
+    blocked = ["rm -rf", "mkfs", "shutdown", "reboot", "dd if=", "> /dev/sd"]
+    for pattern in blocked:
+        if pattern in command:
+            return {"error": f"命令包含被禁止的模式: {pattern}"}
+    
+    r = ansible_runner.run(
+        private_data_dir="/tmp/ansible",
+        host_pattern=group,
+        module="shell",
+        module_args=command,
+        inventory=INVENTORY,
+        quiet=True,
+    )
+    results = {}
+    for host, data in r.stats.get("dark", {}).items():
+        results[host] = "unreachable"
+    for event in r.events:
+        if event["event"] == "runner_on_ok":
+            host = event["event_data"]["host"]
+            results[host] = event["event_data"]["res"].get("stdout", "")
+    return {"results": results}
+
+@mcp.tool()
+def get_facts(group: str = "all") -> list:
+    """获取主机配置信息"""
+    r = ansible_runner.run(
+        private_data_dir="/tmp/ansible",
+        host_pattern=group,
+        module="setup",
+        module_args="filter=ansible_processor_vcpus,ansible_memtotal_mb,ansible_distribution",
+        inventory=INVENTORY,
+        quiet=True,
+    )
+    facts = []
+    for event in r.events:
+        if event["event"] == "runner_on_ok":
+            f = event["event_data"]["res"].get("ansible_facts", {})
+            facts.append({
+                "host": event["event_data"]["host"],
+                "cpu": f.get("ansible_processor_vcpus", 0),
+                "memory": round(f.get("ansible_memtotal_mb", 0) / 1024, 1),
+                "os": f.get("ansible_distribution", ""),
+            })
+    return facts
+
+@mcp.tool()
+def restart_service(group: str, service: str) -> dict:
+    """安全重启服务"""
+    # 1. 检查状态
+    r1 = ansible_runner.run(private_data_dir="/tmp/ansible", host_pattern=group,
+        module="systemd", module_args=f"name={service} state=started", inventory=INVENTORY, quiet=True)
+    
+    # 2. 执行重启
+    r2 = ansible_runner.run(private_data_dir="/tmp/ansible", host_pattern=group,
+        module="systemd", module_args=f"name={service} state=restarted", inventory=INVENTORY, quiet=True)
+    
+    return {"restarted": r2.stats["ok"], "failed": r2.stats["failures"]}
+
+mcp.run(transport="sse", port=8872)
+```
+
+### Dify 配置
+
+```
+Dify → 工具 → MCP → 添加
+  名称：Ansible
+  URL：http://<ansible-mcp-ip>:8872/sse
+  传输：SSE
+
+Agent 绑定 Ansible MCP 工具后，用户就可以用自然语言管理主机了
+```
+
+**和 Coze 方案对比**：
+
+| | Coze + API | Dify + MCP |
+|---|---|---|
+| 插件开发 | 写 Flask API 服务 | 写 MCP Server（标准协议） |
+| 工具复用 | 仅 Coze 可用 | 任何支持 MCP 的都能用 |
+| 工作流 | 有一定局限 | 更灵活（支持代码执行） |
+| 成本 | Coze 免费额度大 | Dify 完全自部署 |
+| 推荐 | 快速验证 | 生产落地 |
+
+---
+
+## 9.8 用 n8n + Jenkins 做 DevOps + AIOps 智能体
+
+### 场景
+
+将 CI/CD 流水线和 AIOps 结合——让 AI 参与代码构建、测试、发布的决策和通知。
+
+### 架构
+
+```
+GitLab Webhook（代码推送/PR 合并）
+    ↓
+n8n 工作流
+    ├── 触发 Jenkins Pipeline
+    ├── 等待构建结果
+    ├── 如果失败 → LLM 分析失败日志 → 通知开发者+建议修复
+    └── 如果成功 → 自动部署 → 部署后监控检查 → 通知
+```
+
+### Jenkins API 准备
+
+```bash
+# Jenkins 获取 API Token
+# Jenkins → 用户 → Configure → API Token → 生成
+
+# 测试 API
+curl -X POST "http://jenkins:8080/job/deploy-api/build" \
+  --user "admin:<api-token>"
+```
+
+### n8n 完整工作流
+
+#### 节点 1：GitLab Webhook
+
+```
+类型：Webhook
+事件：Push Event / Merge Request Event
+过滤：仅 master/main 分支
+```
+
+#### 节点 2：执行 Fast Check（可选）
+
+```
+类型：Function
+作用：在触发完整 CI/CD 前做快速检查
+  - 配置文件语法检查
+  - 敏感信息扫描
+  - 分支保护规则检查
+```
+
+#### 节点 3：触发 Jenkins
+
+```
+类型：HTTP Request
+方法：POST
+URL：http://jenkins:8080/job/{job_name}/buildWithParameters
+认证：Basic Auth
+Body：
+  {
+    "BRANCH": "{{$json.ref}}",
+    "COMMIT_ID": "{{$json.after}}",
+    "AUTHOR": "{{$json.user_name}}"
+  }
+```
+
+#### 节点 4：轮询 Jenkins 构建状态
+
+```
+类型：Loop / Wait 节点
+逻辑：每 15 秒查询 Jenkins API → 直到构建完成
+API：http://jenkins:8080/job/{job_name}/{build_number}/api/json
+
+Pseudocode：
+  while True:
+    result = get("jenkins/.../api/json")
+    if result.building == false:
+      break
+    sleep(15)
+```
+
+#### 节点 5：IF 分支（构建结果）
+
+```
+条件：构建成功？
+  ├── 成功 → 节点6（部署）
+  └── 失败 → 节点7（失败分析）
+```
+
+#### 节点 6a：自动部署
+
+```
+类型：HTTP Request
+URL：触发部署流水线或 K8s rollout
+通知：#ci-cd 频道：✅ 构建成功，正在部署...
+```
+
+#### 节点 6b：部署后验证
+
+```
+类型：HTTP Request
+检查项：
+  - 新 Pod 是否 Running
+  - 健康检查端点是否 200
+  - P95 延迟是否在正常范围
+  
+失败 → 自动回滚 → 通知
+```
+
+#### 节点 6c：部署成功通知
+
+```
+类型：Slack/飞书/企微/钉钉
+消息：
+  ✅ 部署成功
+  项目：api-service
+  分支：main
+  提交：abc123 (张三: 修复登录bug)
+  部署耗时：3m42s
+  新版本：v2.3.1
+  [查看变更] [回滚]
+```
+
+#### 节点 7a：构建失败分析
+
+```
+类型：HTTP Request（调 LLM API）
+
+调用 LLM 分析构建日志：
+  "以下是 Jenkins 构建失败的日志，请分析失败原因并给出修复建议：
+  {{$node['获取日志'].json.console_output}}"
+```
+
+#### 节点 7b：构建失败通知
+
+```
+类型：Slack/飞书/企微/钉钉 + @提交者
+消息：
+  ❌ 构建失败
+  项目：api-service
+  提交者：@张三
+  提交：abc123
+  失败原因（AI 分析）：缺少依赖包 requests>=2.28.0
+  修复建议：在 requirements.txt 中添加该依赖
+  [查看日志] [重新构建]
+```
+
+### 完整 n8n 工作流 JSON（概念结构）
+
+```json
+{
+  "nodes": [
+    {"name": "GitLab Webhook", "type": "webhook"},
+    {"name": "Fast Check", "type": "function"},
+    {"name": "Trigger Jenkins", "type": "http-request"},
+    {"name": "Poll Build Status", "type": "wait"},
+    {"name": "Build Success?", "type": "if"},
+    {"name": "Deploy", "type": "http-request"},
+    {"name": "Post-Deploy Verify", "type": "http-request"},
+    {"name": "Deploy Success Notify", "type": "slack"},
+    {"name": "Fetch Build Logs", "type": "http-request"},
+    {"name": "AI Analyze Failure", "type": "http-request"},
+    {"name": "Build Fail Notify", "type": "slack"}
+  ]
+}
+```
+
+### 扩展：AIOps + DevOps 能力矩阵
+
+```
+阶段          传统 DevOps          AIOps + DevOps
+────────────────────────────────────────────────
+代码提交      lint + unit test    AI 代码审查
+构建          Jenkins             Jenkins + AI 日志分析
+测试          自动化测试           AI 判断失败是否 flaky（可忽略）
+部署          人工审批             AI 评估风险 → 自动审批低风险部署
+发布          灰度发布             AI 分析灰度指标 → 自动决策全量或回滚
+监控          告警通知             AI 诊断 + 自动修复建议
+事后分析      人工写复盘           AI 自动生成故障复盘草稿
+```
+
