@@ -16,47 +16,70 @@ import urllib.error
 from models import CATEGORIES
 
 
-class VLLMClient:
+class OpenAICompatClient:
+    """对接任意 OpenAI 兼容 /v1 服务：vLLM、Ollama、LM Studio、SGLang…
+
+    response_format 自动降级：json_schema → json_object → 纯 prompt。
+    不同 server 对结构化输出支持程度不一（vLLM 支持 json_schema 引导解码，
+    Ollama/旧服务可能只认 json_object），降级 + 宽松解析保证到处能跑。
+    """
+
     def __init__(self, base_url="http://localhost:8000/v1",
                  model="Qwen/Qwen3-8B", api_key="not-needed",
-                 timeout=60, json_schema=None):
+                 timeout=120, json_schema=None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
         self.json_schema = json_schema
 
-    def generate(self, messages: list[dict]) -> str:
-        body = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.0,   # RCA 要稳定可复现
-            "max_tokens": 1024,
-        }
-        if self.json_schema is not None:
-            # vLLM 支持 OpenAI 风格 response_format=json_schema（引导解码）
-            body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {"name": "rca_output", "schema": self.json_schema},
-            }
-            # 兼容写法：部分 vLLM 版本用 extra body 的 guided_json
-            body["guided_json"] = self.json_schema
-        data = json.dumps(body).encode()
+    def _post(self, body: dict) -> str:
         req = urllib.request.Request(
-            f"{self.base_url}/chat/completions", data=data,
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.api_key}"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                payload = json.loads(resp.read().decode())
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"连不上 vLLM ({self.base_url})：{e}\n"
-                f"请先启动：vllm serve {self.model}"
-            ) from e
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            payload = json.loads(resp.read().decode())
         return payload["choices"][0]["message"]["content"]
+
+    def generate(self, messages: list[dict]) -> str:
+        modes = []
+        if self.json_schema is not None:
+            modes.append({"type": "json_schema",
+                          "json_schema": {"name": "rca_output",
+                                          "schema": self.json_schema}})
+        modes.append({"type": "json_object"})
+        modes.append(None)   # 纯靠 prompt + 宽松解析兜底
+
+        last_err = None
+        for rf in modes:
+            body = {"model": self.model, "messages": messages,
+                    "temperature": 0.0, "max_tokens": 1024}
+            if rf is not None:
+                body["response_format"] = rf
+            try:
+                return self._post(body)
+            except urllib.error.HTTPError as e:
+                # 4xx 多半是该 server 不支持这种 response_format，降级重试下一档
+                last_err = e
+                if e.code in (400, 404, 422, 500, 501):
+                    continue
+                raise RuntimeError(f"请求 {self.base_url} 失败: HTTP {e.code}") from e
+            except urllib.error.URLError as e:
+                raise RuntimeError(
+                    f"连不上 {self.base_url}：{e}\n"
+                    f"本地没有 OpenAI 兼容服务在跑。macOS 推荐 Ollama：\n"
+                    f"  ollama serve  &&  ollama pull {self.model}\n"
+                    f"再用 --base-url http://localhost:11434/v1 --model {self.model}"
+                ) from e
+        raise RuntimeError(f"所有 response_format 模式均被拒: {last_err}")
+
+
+# 向后兼容的别名
+VLLMClient = OpenAICompatClient
 
 
 # ---- 离线 Mock：确定性替身，用于验证流水线本身 + 复现 prompt 回归 ----
@@ -122,8 +145,9 @@ class MockLLMClient:
 
 
 def make_client(backend: str, **kwargs):
-    if backend == "vllm":
-        return VLLMClient(**kwargs)
+    # vllm / ollama / openai 都走同一个 OpenAI 兼容客户端，区别只在 --base-url / --model
+    if backend in ("vllm", "ollama", "openai"):
+        return OpenAICompatClient(**kwargs)
     if backend == "mock":
         return MockLLMClient()
-    raise ValueError(f"未知后端: {backend}（可选 vllm / mock）")
+    raise ValueError(f"未知后端: {backend}（可选 vllm / ollama / openai / mock）")

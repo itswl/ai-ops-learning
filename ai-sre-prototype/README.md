@@ -29,22 +29,43 @@ python3 demo_e2e.py --backend mock
 #   → 资源类事件触发重启并执行；发布类事件只建议不自动执行
 ```
 
-## 接本地 vLLM
+## 接真实模型（任意 OpenAI 兼容服务）
+
+`--backend vllm/ollama/openai` 都走同一个 stdlib `urllib` 客户端,只连 `/v1/chat/completions`,**不需要装 openai 包**。response_format 自动降级(json_schema → json_object → 纯 prompt),所以对接谁都行。
+
+### Linux + NVIDIA GPU：vLLM
 
 ```bash
-# 起一个 OpenAI 兼容服务
-vllm serve Qwen/Qwen3-8B
-
-# 把上面命令的 --backend mock 换成 --backend vllm 即可
+vllm serve Qwen/Qwen3-8B     # 默认 :8000
 python3 eval/run_eval.py --backend vllm --model Qwen/Qwen3-8B
-python3 eval/run_eval.py --backend vllm --prompt prompts/rca_v2_broken.txt
-python3 demo_e2e.py --backend vllm
-
-# 想留存指标做版本对比：
-python3 eval/run_eval.py --backend vllm --json-out results_v1.json
 ```
 
-`--backend vllm` 用 stdlib `urllib` 直连 `/v1/chat/completions`，走 `response_format=json_schema` 引导解码，**不需要装 openai 包**。base-url 默认 `http://localhost:8000/v1`，可用 `--base-url` 改。
+### macOS（Apple Silicon）：用 Ollama，别用 vLLM
+
+vLLM 在 macOS 只有实验性 CPU 后端，跑 8B 不可用。Mac 上用 Ollama（Metal 加速）：
+
+```bash
+# 装（任选）：brew install ollama  或官网安装包
+ollama serve &                 # 起服务，OpenAI 兼容口在 :11434/v1
+ollama pull qwen3:8b           # 拉模型（首次几个 GB）
+
+python3 eval/run_eval.py --backend ollama \
+  --base-url http://localhost:11434/v1 --model qwen3:8b
+python3 eval/run_eval.py --backend ollama \
+  --base-url http://localhost:11434/v1 --model qwen3:8b \
+  --prompt prompts/rca_v2_broken.txt        # 看真实模型的回归幅度
+python3 demo_e2e.py --backend ollama \
+  --base-url http://localhost:11434/v1 --model qwen3:8b
+```
+
+### 远程 GPU 上的 vLLM
+
+```bash
+python3 eval/run_eval.py --backend vllm \
+  --base-url http://<gpu-box>:8000/v1 --model Qwen/Qwen3-8B
+```
+
+留存指标做版本/后端对比：`--json-out results_ollama.json`。
 
 ## 目录
 

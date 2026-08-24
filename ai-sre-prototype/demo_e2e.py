@@ -73,7 +73,8 @@ def decide_and_remediate(rca: RCAOutput, target, incident_id, action) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default="mock", choices=["mock", "vllm"])
+    ap.add_argument("--backend", default="mock",
+                    choices=["mock", "vllm", "ollama", "openai"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--base-url", default="http://localhost:8000/v1")
     args = ap.parse_args()

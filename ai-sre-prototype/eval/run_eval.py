@@ -123,7 +123,8 @@ def print_report(metrics, per_sample, verbose):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default="mock", choices=["mock", "vllm"])
+    ap.add_argument("--backend", default="mock",
+                    choices=["mock", "vllm", "ollama", "openai"])
     ap.add_argument("--prompt", default=None, help="system prompt 文件，默认 v1_good")
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
