@@ -117,10 +117,10 @@
 "Kubernetes 集群于 2024-03-15 发生故障。故障原因是 etcd 磁盘空间满。
 运维团队通过扩容 etcd 存储解决。后续增加了磁盘监控告警。"
 
-切块（512 token 策略）：
+切块示意（真实场景 512 token 能装下整段，这里故意用极小的块演示"重叠"机制）：
   Chunk 1: "Kubernetes 集群于 2024-03-15 发生故障。故障原因是 etcd 磁盘空间满。"
   Chunk 2: "故障原因是 etcd 磁盘空间满。运维团队通过扩容 etcd 存储解决。后续增加了磁盘监控告警。"
-  （注意 Chunk 1 和 Chunk 2 有 50 token 重叠，保证跨 chunk 的连续性）
+  （Chunk 1 和 Chunk 2 重叠了一句，保证跨 chunk 的语义连续性）
 ```
 
 #### 第 3 步：向量化（Embedding）
@@ -204,7 +204,8 @@ down-after-milliseconds 建议 5000-10000...
 | **BGE-M3** | 1024 | ★★★★★ | 国产最强，支持多语言，8192 上下文 | **中文首选** |
 | **BGE-large-zh** | 1024 | ★★★★★ | 中文专精，轻量 | 纯中文场景 |
 | **M3E-large** | 1024 | ★★★★ | 国产开源，社区活跃 | 性价比之选 |
-| **GTE-Qwen2** | 768-2048 | ★★★★★ | 阿里出品，多尺寸可选 | 长文本检索 |
+| **Qwen3-Embedding** | 1024/2560/4096（支持 MRL 降维） | ★★★★★ | 阿里 2025 出品，0.6B/4B/8B 三档，多语言榜前列 | 中英混合、追新 |
+| **GTE-Qwen2** | 1536（1.5B 版）/ 3584（7B 版） | ★★★★★ | 阿里上一代，仍很能打 | 长文本检索 |
 | **jina-embeddings-v3** | 1024 | ★★★★ | 支持任务特定 LoRA | 多语言通用 |
 | **text-embedding-3-large** | 3072 | ★★★ | OpenAI 官方，效果好 | 海外场景，用 API |
 | **Cohere Embed v3** | 1024 | ★★★ | 企业级，分类任务强 | 海外商业场景 |
@@ -405,9 +406,10 @@ prompt = f"""参考以下文档回答问题，无法确定请说明：
 
 ## 回答"""
 
-# 4. 调用 LLM（这里以 OpenAI 为例，可换成任意 API）
-client = OpenAI()
-response = client.chat.completions.create(
+# 4. 调用 LLM（这里以 OpenAI 为例，可换成任意 API；
+#    注意别复用上面 chromadb 的 client 变量名）
+llm = OpenAI()
+response = llm.chat.completions.create(
     model="gpt-4o",
     messages=[{"role": "user", "content": prompt}],
 )

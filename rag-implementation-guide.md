@@ -99,16 +99,18 @@ Milvus
 #### 方式一：Docker 快速启动（推荐开发/测试）
 
 ```bash
-# 单机版，一条命令
-curl -sfL https://raw.githubusercontent.com/milvus-io/milvus/master/scripts/standalone_embed.sh \
-  | bash -s -- latest
+# 单机版，官方脚本（注意参数是 start，不是版本号）
+curl -sfL https://raw.githubusercontent.com/milvus-io/milvus/master/scripts/standalone_embed.sh -o standalone_embed.sh
+bash standalone_embed.sh start
 
-# 验证
+# 验证：这个脚本只起一个容器（etcd 以嵌入模式跑在里面，存储用本地盘）
 docker ps | grep milvus
-# 输出三个容器：
 # milvus-standalone       — Milvus 主服务（端口 19530, 9091）
-# milvus-minio            — 对象存储
-# milvus-etcd             — 元数据存储
+
+# 如果想要经典的三容器架构（standalone + etcd + minio），
+# 用官方 docker-compose.yml：
+# wget https://github.com/milvus-io/milvus/releases/latest/download/milvus-standalone-docker-compose.yml -O docker-compose.yml
+# docker compose up -d
 ```
 
 #### 方式二：Milvus Lite（最轻量）
@@ -191,11 +193,13 @@ for hits in results:
 
 ```python
 # 只查「故障类」文档
+# 注意：tags 是数组，数组包含要用 json_contains；
+# `tags in ["故障"]` 是判断整个 tags 值等于"故障"，对数组字段查不出结果，这是常见坑
 results = client.search(
     collection_name="ops_knowledge",
     data=[query_vector],
     limit=5,
-    filter='tags in ["故障"]',      # 标量过滤
+    filter='json_contains(tags, "故障")',      # 标量过滤
     output_fields=["text", "source", "tags"],
 )
 
@@ -204,7 +208,7 @@ results = client.search(
     collection_name="ops_knowledge",
     data=[query_vector],
     limit=5,
-    filter='tags in ["故障"] and created_at > "2024-03-01"',
+    filter='json_contains(tags, "故障") and created_at > "2024-03-01"',
     output_fields=["text", "source", "tags", "created_at"],
 )
 ```
@@ -313,10 +317,11 @@ FastGPT 的核心能力：
 ```
 FastGPT
 ├── FastGPT 主服务           — Web UI + API
-├── PostgreSQL               — 业务数据（用户、应用、对话记录）
-├── MongoDB                  — 日志、数据集缓存
-├── 向量数据库（Milvus/PGVector）— 知识库向量存储
+├── MongoDB                  — 业务主库（用户、应用、对话记录）
+├── PostgreSQL(pgvector) 或 Milvus/Zilliz — 知识库向量存储
 └── LLM + Embedding 模型     — 可接 API 或本地服务
+
+（注意：Mongo 是业务主库、PG 只负责向量，很多资料把这两个写反）
 ```
 
 #### 安装部署
@@ -327,58 +332,30 @@ FastGPT
 # 1. 创建目录
 mkdir fastgpt && cd fastgpt
 
-# 2. 下载配置文件
-curl -O https://raw.githubusercontent.com/labring/FastGPT/main/projects/app/data/deploy/docker-compose.yml
-curl -O https://raw.githubusercontent.com/labring/FastGPT/main/projects/app/data/deploy/config.json
+# 2. 下载部署文件（按向量库选 compose 变体：pgvector / milvus / zilliz）
+#    注意：老教程里的 projects/app/data/deploy/ 路径不存在，正确路径是 deploy/docker/
+curl -o docker-compose.yml \
+  https://raw.githubusercontent.com/labring/FastGPT/main/deploy/docker/docker-compose-pgvector.yml
+curl -o config.json \
+  https://raw.githubusercontent.com/labring/FastGPT/main/projects/app/data/config.json
 
-# 3. 编辑 config.json，配置 LLM 和 Embedding
-# 关键配置项见下方
+# 3. 编辑 docker-compose.yml 里的密码等环境变量
 
 # 4. 启动
-docker-compose up -d
+docker compose up -d
 
-# 5. 访问 http://localhost:3000
+# 5. 访问 http://localhost:3000（默认账号 root，密码在 compose 的
+#    DEFAULT_ROOT_PSW 环境变量里）
 ```
 
-**关键配置 config.json**：
+**模型接入**：新版 FastGPT（4.8.20+）推荐在**管理后台的"模型提供商"页面**里配置 LLM 和 Embedding（走内置 AI Proxy / OneAPI），不再需要手改 config.json。接本地 vLLM 就是加一个 OpenAI 兼容渠道：
 
-```json
-{
-  "llmModels": [
-    {
-      "model": "qwen3-8b",
-      "name": "Qwen3-8B (本地)",
-      "maxContext": 16000,
-      "maxResponse": 4096,
-      "quoteMaxToken": 13000,
-      "price": 0,
-      "provider": "OpenAI",
-      "url": "http://host.docker.internal:8000/v1/chat/completions",
-      "key": "not-needed"
-    }
-  ],
-  "vectorModels": [
-    {
-      "model": "bge-m3",
-      "name": "BGE-M3",
-      "price": 0,
-      "defaultToken": 1024,
-      "maxToken": 8192,
-      "provider": "OpenAI",
-      "url": "http://host.docker.internal:8001/v1/embeddings",
-      "key": "not-needed"
-    }
-  ],
-  "db": {
-    "postgres": {
-      "host": "postgres",
-      "port": 5432,
-      "user": "postgres",
-      "password": "your_password",
-      "database": "fastgpt"
-    }
-  }
-}
+```
+渠道地址: http://host.docker.internal:8000/v1
+模型名:   qwen3-8b
+密钥:     任意占位
+
+Embedding 同理，指向 http://host.docker.internal:8001/v1（部署的 BGE-M3 服务）
 ```
 
 **方式二：阿里云/腾讯云一键部署**
@@ -481,7 +458,7 @@ curl http://localhost:3000/api/v1/chat/completions \
 
 #### 场景描述
 
-某公司运维团队积累了 500+ 篇故障复盘文档，分布在 Confluence、语雀、GitLab Wiki 中。每次新人值班遇到故障都要翻半天文档。目标是搭建一个**内部运维故障知识库问答系统**。
+虚构练习场景：某公司运维团队积累了 500+ 篇故障复盘文档，分布在 Confluence、语雀、GitLab Wiki 中。每次新人值班遇到故障都要翻半天文档。目标是搭建一个**内部运维故障知识库问答系统**。
 
 #### 实施步骤
 
@@ -647,10 +624,11 @@ cd ragflow
 # 2. 检查配置（一般用默认即可）
 vim docker/.env
 # 关键配置：
-#   RAGFLOW_IMAGE=infiniflow/ragflow:latest
+#   RAGFLOW_IMAGE=infiniflow/ragflow:<最新版本号>
 #   MYSQL_PASSWORD=infini_rag_flow
-#   ES_PASSWORD=infini_rag_flow
+#   ELASTIC_PASSWORD=infini_rag_flow   # 变量名是 ELASTIC_PASSWORD，不是 ES_PASSWORD
 #   REDIS_PASSWORD=infini_rag_flow
+#   （另可用 DOC_ENGINE=infinity 把 ES 换成自研的 Infinity 引擎）
 
 # 3. 启动所有服务
 docker-compose -f docker/docker-compose.yml up -d
@@ -699,10 +677,9 @@ RAGFlow 控制台 → 模型供应商：
 知识库 → 新建知识库
   名称：运维文档库
   语言：中文
-  分块方法：智能分块（推荐）或 按标题层级
+  分块方法：General（通用，默认）；复杂文档按类型选专用模板
+           （Paper / Book / Laws / Table / Q&A / Presentation 等）
   嵌入模型：BGE-M3
-  
-  「智能分块」会根据文档结构自动选择最优的切块策略
 ```
 
 #### Step 2：上传文档
@@ -752,7 +729,7 @@ RAGFlow 擅长处理复杂 PDF，很适合这个场景。
 
 #### 场景描述
 
-某公司每天收到几十份合同、标书、供应商资质文件，需要人工逐条核对合规条款。目标是用 RAGFlow 搭建一个**合同合规审查助手**，自动检查文档中的风险条款。
+虚构练习场景：某公司每天收到几十份合同、标书、供应商资质文件，需要人工逐条核对合规条款。目标是用 RAGFlow 搭建一个**合同合规审查助手**，自动检查文档中的风险条款。
 
 #### 实施步骤
 
@@ -831,6 +808,8 @@ def review_contract(contract_path: str) -> dict:
     chat_id = resp.json()["data"]["id"]
 
     # 3. 发送审查请求
+    #   （字段名以 RAGFlow 官方 HTTP API 文档为准，不同版本 completions
+    #     的会话/文档关联字段有变动，跑之前先对一遍 API Reference）
     resp = requests.post(
         f"{RAGFLOW_URL}/chats/{chat_id}/completions",
         headers={"Authorization": f"Bearer {API_KEY}"},
@@ -840,7 +819,6 @@ def review_contract(contract_path: str) -> dict:
 输出格式：表格，含审查项、判定、风险等级、原因、修改建议。
             """,
             "stream": False,
-            "doc_ids": [doc_id],  # 临时文档 ID
         },
     )
 
@@ -1099,7 +1077,7 @@ result = app.invoke({"question": "Redis 切换失败怎么办", "iteration": 0, 
 | **Dify** | 工作流引擎最强，Agent 强，国际化好 | Docker / 云 | 复杂工作流 |
 | **MaxKB** | 国信证券开源，金融级安全，信创适配 | Docker | 金融/政务合规 |
 | **AnythingLLM** | 极简，单机零配置 | Docker / 桌面 | 个人知识库 |
-| **Coze/扣子** | 字节出品，免费额度大 | 仅 SaaS | 快速验证 |
+| **Coze/扣子** | 字节出品，免费额度大 | SaaS + 开源版 Coze Studio 可自部署（2025-07 开源） | 快速验证 |
 | **百度千帆 AppBuilder** | 百度生态，内置 ERNIE | 仅 SaaS | 已用百度云 |
 
 ### Dify 快速上手
@@ -1133,10 +1111,12 @@ PDF 里的表格、扫描件、双栏排版是 RAG 效果的隐形天花板。
 
 ### MinerU
 
-```python
-from magic_pdf import parse_pdf
-result = parse_pdf("ops_manual.pdf", output_dir="./parsed/", method="auto", lang="zh")
-# 表格以 Markdown table 保留，公式以 LaTeX 保留
+```bash
+# MinerU 2.x 起包名和命令都叫 mineru（老版包名 magic-pdf 已弃用，
+# 也不存在 from magic_pdf import parse_pdf 这种一行式 API）
+pip install "mineru[core]"
+mineru -p ops_manual.pdf -o ./parsed/
+# 输出 Markdown：表格以 Markdown table 保留，公式以 LaTeX 保留
 ```
 
 ### Docling
@@ -1161,11 +1141,11 @@ for el in elements:
 
 ## 6.9 Reranker（重排序）
 
-Embedding 粗筛 Top-20 → Reranker 精排取 Top-3，效果对比：
+Embedding 粗筛 Top-20 → Reranker 精排取 Top-3。经验量级（具体数字因数据集差异很大，以自己的评测集为准）：
 
 ```
-纯向量检索：Top-5 召回率 ~85%
-向量 + Reranker：Top-3 召回率 ~95%
+纯向量检索：Top-5 召回率通常 80-90%
+向量 + Reranker：Top-3 就能到 90-95%+
 ```
 
 | 模型 | 特点 | 推荐度 |
@@ -1201,13 +1181,20 @@ scored = sorted(zip(passages, scores), key=lambda x: x[1], reverse=True)
 ### LightRAG 实战
 
 ```python
+# 骨架示意；llm_model_func 要传 async 补全函数，
+# lightrag 没有 OpenAILike 这个类，OpenAI 兼容端点用 openai_complete_if_cache 包一层
 from lightrag import LightRAG, QueryParam
-from lightrag.llm import OpenAILike
+from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+
+async def llm_func(prompt, **kwargs):
+    return await openai_complete_if_cache(
+        "qwen3-8b", prompt,
+        base_url="http://localhost:8000/v1", api_key="not-needed", **kwargs)
 
 rag = LightRAG(
     working_dir="./lightrag_ops",
-    llm_model_func=OpenAILike(api_base="http://localhost:8000/v1", model="qwen3-8b"),
-    embedding_model_func=lambda texts: embed_model.encode(texts).tolist(),
+    llm_model_func=llm_func,
+    embedding_func=openai_embed,  # 或自定义 EmbeddingFunc 包 BGE-M3
 )
 
 with open("ops_docs/2024_faults.txt") as f:

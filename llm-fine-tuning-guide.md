@@ -184,7 +184,7 @@ model = FastLanguageModel.get_peft_model(
   {
     "instruction": "将以下自然语言转换为 kubectl 命令",
     "input": "查看 kube-system 命名空间中所有 CrashLoopBackOff 状态的 pod",
-    "output": "kubectl get pods -n kube-system --field-selector=status.phase!=Running | grep CrashLoopBackOff\n# 或者更精确：\nkubectl get pods -n kube-system -o json | jq -r '.items[] | select(.status.containerStatuses[].state.waiting.reason==\"CrashLoopBackOff\") | .metadata.name'"
+    "output": "kubectl get pods -n kube-system --no-headers | awk '$3==\"CrashLoopBackOff\"{print $1}'\n# 或者更精确（注意不能用 --field-selector=status.phase!=Running，CrashLoopBackOff 的 Pod phase 是 Running）：\nkubectl get pods -n kube-system -o json | jq -r '.items[] | select(.status.containerStatuses[]?.state.waiting?.reason==\"CrashLoopBackOff\") | .metadata.name'"
   }
 ]
 ```
@@ -414,7 +414,7 @@ llamafactory-cli webui
 llamafactory-cli train \
   --model_name_or_path Qwen/Qwen3-8B \
   --dataset my_ops_data \
-  --template qwen \
+  --template qwen3 \
   --finetuning_type lora \
   --lora_rank 16 \
   --lora_target all \
@@ -436,7 +436,7 @@ llamafactory-cli train \
 llamafactory-cli export \
   --model_name_or_path Qwen/Qwen3-8B \
   --adapter_name_or_path ./output/qwen3-ops-lora \
-  --template qwen \
+  --template qwen3 \
   --finetuning_type lora \
   --export_dir ./output/qwen3-ops-merged \
   --export_size 2 \
@@ -448,16 +448,16 @@ llamafactory-cli export \
 ```bash
 llamafactory-cli chat \
   --model_name_or_path ./output/qwen3-ops-merged \
-  --template qwen
+  --template qwen3
 # 输入你的运维问题，对比微调前后的差异
 ```
 
 #### 步骤 6：用 vLLM 部署（生产环境）
 
 ```bash
-# 微调合并后的模型可直接用 vLLM 部署
-python -m vllm.entrypoints.openai.api_server \
-  --model ./output/qwen3-ops-merged \
+# 微调合并后的模型可直接用 vLLM 部署（新版 CLI 是 vllm serve，
+# 老写法 python -m vllm.entrypoints.openai.api_server 也还能用）
+vllm serve ./output/qwen3-ops-merged \
   --served-model-name ops-assistant \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.9

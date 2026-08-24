@@ -82,7 +82,8 @@ docker run -d --gpus all --rm \
 # DCGM_FI_DEV_GPU_TEMP        — 温度
 # DCGM_FI_DEV_POWER_USAGE     — 功耗
 # DCGM_FI_DEV_XID_ERRORS      — XID 错误（硬件故障的关键信号）
-# DCGM_FI_DEV_ECC_FAILURES    — ECC 内存错误
+# DCGM_FI_DEV_ECC_DBE_VOL_TOTAL — ECC 双比特错误（不可纠正，最危险）
+# DCGM_FI_DEV_ECC_SBE_VOL_TOTAL — ECC 单比特错误（可纠正，看趋势）
 ```
 
 #### 推理框架自带监控
@@ -193,7 +194,7 @@ groups:
 
       # ECC 错误
       - alert: GPUECCError
-        expr: increase(DCGM_FI_DEV_ECC_FAILURES[5m]) > 0
+        expr: increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL[5m]) > 0
         labels:
           severity: critical
         annotations:
@@ -367,6 +368,8 @@ ollama list
 
 **方案二：用 AutoAWQ 自己量化**
 
+> 注意：AutoAWQ 项目 2025 年已归档停止维护，存量用法如下仍可用；新项目建议用 vLLM 团队维护的 [llm-compressor](https://github.com/vllm-project/llm-compressor)，或直接下载模型方发布的 AWQ/GPTQ 版本。
+
 ```python
 from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer
@@ -397,24 +400,25 @@ tokenizer.save_pretrained(quant_path)
 **方案三：用 vLLM 加载 AWQ 量化模型**
 
 ```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model ./qwen3-8b-awq \
+vllm serve ./qwen3-8b-awq \
   --quantization awq \
   --dtype auto \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.95
 ```
 
-#### 量化效果实测参考（Qwen2.5-7B）
+#### 量化效果量级参考（7B 级模型，单请求场景）
 
-| 精度                 | 显存占用    | 推理速度 (t/s) | 困惑度 (越低越好) | 相比 FP16 损失 |
-| ------------------ | ------- | ---------- | ---------- | ---------- |
-| FP16               | 14.2 GB | 68         | 8.42       | 基准         |
-| INT8               | 7.8 GB  | 58         | 8.44       | +0.2%      |
-| INT4 (AWQ)         | 5.1 GB  | 52         | 8.51       | +1.1%      |
-| INT4 (GGUF Q4_K_M) | 5.3 GB  | 48         | 8.55       | +1.5%      |
+下表是量级示意，不是某次真实实测——不同 GPU、batch、kernel 差异很大，务必以自己环境的压测为准：
 
-> 结论：INT4 量化用 1/3 的显存换来了 98%+ 的效果，性价比极高。
+| 精度                 | 显存占用    | 单流推理速度趋势 | 困惑度变化（越低越好） |
+| ------------------ | ------- | ---------- | ---------- |
+| FP16               | ~14 GB  | 基准         | 基准         |
+| INT8               | ~8 GB   | 略快（权重读取减半） | 几乎无损（+0.2% 量级） |
+| INT4 (AWQ/GPTQ)    | ~5 GB   | 单流通常快 1.3-1.8x（decode 是带宽瓶颈，权重变小直接提速）；大 batch 下反可能因反量化开销变慢 | 轻微损失（+1% 量级） |
+| INT4 (GGUF Q4_K_M) | ~5 GB   | 取决于 llama.cpp 后端 | 略高于 AWQ    |
+
+> 结论：INT4 用 1/3 的显存保住 98%+ 的效果；单流/低并发下通常还更快。需要记住的反直觉点是：**量化在大 batch 高并发（compute-bound）场景可能不加速甚至变慢**，是否量化要按你的流量模式测。
 
 ---
 
@@ -547,42 +551,34 @@ pip install -e .
 
 **Logits 蒸馏示例**：
 
+DistillKit 不是一个 `pip import` 的库，而是"脚本 + 配置文件"的用法（仓库里的 `distil_logits.py`）。在脚本的 config 里改这几个关键项（注意 Qwen3 没有 7B/70B 这两个尺寸，稠密版最大是 32B）：
+
 ```python
-from distillkit import LogitsDistillationTrainer
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
+# distil_logits.py 中的 config 节选
+config = {
+    "models": {
+        "teacher": "Qwen/Qwen3-32B",   # 教师：大模型
+        "student": "Qwen/Qwen3-8B",    # 学生：小模型（要求同 tokenizer 词表）
+    },
+    "tokenizer": {"max_length": 2048},
+    "training": {
+        "output_dir": "./qwen3-8b-distilled",
+        "num_train_epochs": 3,
+        "per_device_train_batch_size": 4,
+        "learning_rate": 2e-5,
+        "bf16": True,
+    },
+    "distillation": {
+        "temperature": 5.0,   # 温度，越大教师分布的暗知识越多
+        "alpha": 0.8,         # 软标签权重（0.8 = 80% 学教师，20% 学标准答案）
+    },
+}
+```
 
-# 加载教师模型（大模型，如 70B）
-teacher = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3-70B",
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-)
-
-# 加载学生模型（小模型，如 7B）
-student = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3-7B",
-    torch_dtype=torch.bfloat16,
-)
-
-# 蒸馏配置
-trainer = LogitsDistillationTrainer(
-    teacher_model=teacher,
-    student_model=student,
-    temperature=5.0,      # 温度，越大教师分布的暗知识越多
-    alpha=0.8,            # 软标签权重（0.8 = 80% 学教师，20% 学标准答案）
-    max_seq_length=2048,
-)
-
-# 开始蒸馏
-trainer.train(
-    train_dataset="path/to/dataset.json",
-    output_dir="./qwen3-7b-distilled",
-    num_train_epochs=3,
-    per_device_train_batch_size=4,
-    learning_rate=2e-5,
-    fp16=True,
-)
+```bash
+# 然后用 accelerate 启动（Logits 蒸馏要求教师和学生同时进显存，
+# 32B 教师 + 8B 学生至少要 2×80G 卡）
+accelerate launch distil_logits.py
 ```
 
 **隐式蒸馏（数据蒸馏）示例**——更简单且效果很好的方式：
@@ -592,8 +588,8 @@ trainer.train(
 
 from transformers import pipeline
 
-# 1. 用教师模型生成训练数据
-teacher = pipeline("text-generation", model="Qwen/Qwen3-70B")
+# 1. 用教师模型生成训练数据（也可以直接调 DeepSeek/Qwen 的 API 当教师，更省事）
+teacher = pipeline("text-generation", model="Qwen/Qwen3-32B")
 
 training_data = []
 questions = load_questions("ops_questions.json")  # 加载问题列表
@@ -725,32 +721,22 @@ EvalScope 是阿里开源的模型评测框架，也内置了压测能力。
 pip install evalscope
 ```
 
-```python
-# eval_benchmark.py — EvalScope 压测脚本
-from evalscope.perf import BenchmarkRunner, BenchmarkConfig
+EvalScope 压测走的是 `evalscope perf` 子命令（CLI），不是 Python 类：
 
-# 配置压测
-config = BenchmarkConfig(
-    model="Qwen3-8B",
-    api_url="http://localhost:8000/v1/chat/completions",
-    api_key="not-needed",  # 本地 vLLM 不需要
-    # 压测参数
-    concurrency=[1, 5, 10, 20, 50],  # 梯度并发
-    duration=300,         # 每个梯度 5 分钟
-    max_prompt_length=512,
-    max_tokens=256,
-    # 数据集
-    dataset="random",     # 或用自定义数据集
-    dataset_path=None,
-    # 输出
-    output_dir="./benchmark_results",
-)
+```bash
+# 单个并发梯度压一轮；要梯度加压就换 --parallel 多跑几轮
+evalscope perf \
+  --url "http://localhost:8000/v1/chat/completions" \
+  --api openai \
+  --model Qwen3-8B \
+  --parallel 10 \
+  --number 200 \
+  --dataset openqa \
+  --max-tokens 256 \
+  --stream
 
-runner = BenchmarkRunner(config)
-results = runner.run()
-
-# 结果包含：每个并发梯度的 QPS / TTFT / TPOT / 延迟分布
-print(results.summary())
+# 跑完输出：QPS、平均/分位延迟、TTFT、TPOT、吞吐（token/s）
+# 结果默认落在 ./outputs/ 目录，可出对比报告
 ```
 
 #### 7.3.2.4 Locust
@@ -797,12 +783,14 @@ class LLMUser(HttpUser):
                     if first_token_time is None:
                         first_token_time = time.time()
                         ttft = first_token_time - start_time
-                        # 上报 TTFT
+                        # 上报 TTFT（Locust 2.x 自定义上报需带 exception/context）
                         events.request.fire(
                             request_type="llm",
                             name="ttft",
                             response_time=ttft * 1000,
                             response_length=0,
+                            exception=None,
+                            context={},
                         )
                     token_count += 1
 
@@ -815,6 +803,8 @@ class LLMUser(HttpUser):
                 name="end_to_end",
                 response_time=total_time * 1000,
                 response_length=token_count,
+                exception=None,
+                context={},
             )
 
             # 上报每个 token 生成时间
@@ -823,7 +813,10 @@ class LLMUser(HttpUser):
                 name="tpot",
                 response_time=tpot * 1000,
                 response_length=0,
+                exception=None,
+                context={},
             )
+            response.success()
 ```
 
 ```bash
@@ -960,9 +953,10 @@ location /v1/chat/completions {
     # 限制请求速率
     limit_req zone=llm_api burst=10 nodelay;
 
-    # WAF 规则
-    ModSecurityEnabled on;
-    ModSecurityConfig modsecurity.conf;
+    # WAF 规则（nginx 用的是 ModSecurity v3 connector 的指令；
+    # ModSecurityEnabled/ModSecurityConfig 是 Apache 版的写法，别混用）
+    modsecurity on;
+    modsecurity_rules_file /etc/nginx/modsec/main.conf;
 
     proxy_pass http://vllm_backend;
 }
@@ -1013,11 +1007,10 @@ def sanitize_output(text: str) -> str:
 **vLLM 层防护参数**：
 
 ```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model ./qwen3-8b-awq \
+vllm serve ./qwen3-8b-awq \
   --max-model-len 4096 \           # 限制输入+输出总长度
   --max-num-seqs 64 \              # 最大并发序列数
-  --gpu-memory-utilization 0.85 \  # 不为压测留余量，而是为安全留
+  --gpu-memory-utilization 0.85    # 留 15% 余量，防止碎片和峰值 OOM
 ```
 
 **Nginx 层限流**：

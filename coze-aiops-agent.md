@@ -140,38 +140,27 @@ def describe_instances():
 ```javascript
 // Coze IDE 插件（Node.js）
 // 功能：智能重启 K8s Pod 并通知钉钉
+//
+// 注意：Coze IDE 的真实约定是「导出一个 handler 函数」，
+// 输入/输出参数在 IDE 的"元数据"面板里定义（不是在代码里写 inputs/outputs 对象）。
+// 下面把业务逻辑组织成类只是为了可读，入口必须是 handler。
+
+const K8S_API = "https://your-k8s-api-server";
+const DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=xxx";
+
+export async function handler({ input, logger }) {
+  const agent = new SmartRestartPod();
+  return await agent.run(input);
+}
 
 class SmartRestartPod {
   constructor() {
-    this.k8sApi = "https://your-k8s-api-server";
-    this.dingtalkWebhook = "https://oapi.dingtalk.com/robot/send";
+    this.k8sApi = K8S_API;
+    this.dingtalkWebhook = DINGTALK_WEBHOOK;
   }
 
-  inputs = {
-    pod_name: {
-      type: "string",
-      description: "Pod 名称",
-      required: true,
-    },
-    namespace: {
-      type: "string",
-      description: "命名空间",
-      required: false,
-      default: "prod",
-    },
-    reason: {
-      type: "string",
-      description: "重启原因（会记录到通知中）",
-      required: true,
-    },
-  };
-
-  outputs = {
-    result: { type: "object" },
-  };
-
   async run(inputs) {
-    const { pod_name, namespace, reason } = inputs;
+    const { pod_name, namespace = "prod", reason } = inputs;
 
     // 1. 查询 Pod 状态
     const podStatus = await this.getPodStatus(pod_name, namespace);
@@ -248,8 +237,6 @@ class SmartRestartPod {
     throw new Error(`Pod ${name} 在 ${timeout}s 内未就绪`);
   }
 }
-
-module.exports = SmartRestartPod;
 ```
 
 ---
@@ -296,15 +283,19 @@ AK_ID = "LTAI5xxxxxxxxx"
 AK_SECRET = "xxxxxxxxxxxxxxxxxxxxxxxx"
 REGION = "cn-hangzhou"
 
-def aliyun_request(action, params=None):
-    """构造阿里云 OpenAPI 请求（带签名）"""
+def aliyun_request(action, params=None,
+                   endpoint="https://ecs.cn-hangzhou.aliyuncs.com/",
+                   version="2014-05-26"):
+    """构造阿里云 OpenAPI 请求（RPC 风格 V1 签名）。
+    生产建议直接用官方 SDK（alibabacloud_ecs20140526 / alibabacloud_cms20190101），
+    手写签名仅用于理解原理。"""
     if params is None:
         params = {}
     
     # 公共参数
     body = {
         "Action": action,
-        "Version": "2014-05-26",
+        "Version": version,
         "RegionId": REGION,
         "Format": "JSON",
         "Timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -324,7 +315,7 @@ def aliyun_request(action, params=None):
     ).decode()
     body["Signature"] = signature
     
-    resp = requests.get("https://ecs.cn-hangzhou.aliyuncs.com/", params=body)
+    resp = requests.get(endpoint, params=body)
     return resp.json()
 
 
@@ -395,23 +386,33 @@ def reboot_instance():
 
 @app.post("/api/ecs/monitor")
 def get_monitor():
-    """获取 ECS 监控指标（CPU/内存/磁盘/网络）"""
+    """获取 ECS 监控指标（CPU/内存/磁盘/网络）
+    注意：DescribeMetricData 是云监控 CMS 的接口（endpoint 是
+    metrics.cn-hangzhou.aliyuncs.com，Version 2019-01-01），
+    不能打到 ECS 的 endpoint 上，实例要通过 Dimensions 传，这三点都容易踩坑。
+    """
     data = request.json
     instance_id = data["instance_id"]
-    metric = data.get("metric", "CPUUtilization")  # CPUUtilization / MemoryUtilization / DiskReadBPS
-    
-    result = aliyun_request("DescribeMetricData", {
-        "Namespace": "acs_ecs_dashboard",
-        "MetricName": metric,
-        "InstanceId": instance_id,
-        "Period": "60",
-        "StartTime": data.get("start_time", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
-        "EndTime": data.get("end_time", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
-    })
-    
+    metric = data.get("metric", "CPUUtilization")  # CPUUtilization / memory_usedutilization 等
+
+    result = aliyun_request(
+        "DescribeMetricData",
+        {
+            "Namespace": "acs_ecs_dashboard",
+            "MetricName": metric,
+            "Dimensions": json.dumps([{"instanceId": instance_id}]),
+            "Period": "60",
+            "StartTime": data.get("start_time", ""),
+            "EndTime": data.get("end_time", ""),
+        },
+        endpoint="https://metrics.cn-hangzhou.aliyuncs.com/",
+        version="2019-01-01",
+    )
+
     return jsonify({
         "metric": metric,
-        "data": result.get("Datapoints", {}).get("Datapoint", []),
+        # CMS 返回的 Datapoints 是 JSON 字符串
+        "data": json.loads(result.get("Datapoints", "[]") or "[]"),
     })
 
 
@@ -423,6 +424,9 @@ def run_command():
         "InstanceId.1": data["instance_id"],
         "Type": "RunShellScript",
         "CommandContent": base64.b64encode(data["command"].encode()).decode(),
+        # 必须显式声明 Base64，RunCommand 默认按明文（PlainText）处理，
+        # 漏了这个参数会把 base64 字符串当命令执行
+        "ContentEncoding": "Base64",
         "Timeout": str(data.get("timeout", 60)),
     })
     return jsonify({
@@ -603,7 +607,7 @@ nodes:
         goto: fetch_monitor
       - if: "{{intent_parser.intent == 'query_status'}}"
         goto: list_ecs
-      - default: goto: llm_fallback
+      - default: llm_fallback
 
   - id: fetch_monitor
     type: plugin
@@ -1516,42 +1520,30 @@ curl -X POST http://<jumpserver-ip>/api/v1/authentication/auth/ \
 
 #### 9.3.2.2 部署 JumpServer MCP
 
+JumpServer 官方有 MCP Server 项目：**github.com/jumpserver/mcp**（老版本教程里流传的 `wojiushixiaobai/jumpserver-mcp` 仓库不存在，是编造的地址）。
+
 ```bash
-git clone https://github.com/wojiushixiaobai/jumpserver-mcp.git /opt/jumpserver-mcp
+git clone https://github.com/jumpserver/mcp.git /opt/jumpserver-mcp
 cd /opt/jumpserver-mcp
-pip install -r requirements.txt
+
+# 官方支持 Docker 部署，核心配置就两项：
+# JumpServer 地址 + API Token（上一步获取）
+# 具体环境变量名和启动方式以仓库 README 为准
+docker build -t jumpserver-mcp .
+docker run -d --name jumpserver-mcp \
+  -p 8870:8870 \
+  -e JUMPSERVER_URL="http://<jumpserver-ip>" \
+  -e JUMPSERVER_TOKEN="abc123..." \
+  jumpserver-mcp
 ```
 
-```bash
-# config.yaml
-jumpserver:
-  url: "http://<jumpserver-ip>"        # JumpServer 地址
-  token: "abc123..."                    # 上一步获取的 Token
-
-mcp:
-  server_name: "jumpserver-mcp"
-  port: 8870
-  transport: "sse"                      # SSE 模式（Dify 兼容）
-```
-
-```bash
-# 启动
-python server.py
-# 或者后台运行
-nohup python server.py > /var/log/jumpserver-mcp.log 2>&1 &
-```
-
-**MCP Server 暴露的工具列表**：
+**MCP Server 暴露的工具（以实际版本为准，围绕资产/连接/审计三类）**：
 
 ```
-暴露的工具（供 Dify 调用）：
-├── list_assets          → 列出所有资产（主机/数据库）
-├── get_asset_info       → 获取单个资产详情
-├── connect_asset        → 通过 JumpServer 连接到资产并执行命令
-├── list_users           → 列出所有用户
-├── get_session_records  → 获取操作审计记录
-├── upload_file          → 通过 JumpServer 上传文件
-└── download_file        → 通过 JumpServer 下载文件
+典型工具（供 Dify 调用）：
+├── 资产类：列资产、查资产详情
+├── 连接类：通过堡垒机在资产上执行命令
+└── 审计类：查询会话/操作记录
 ```
 
 #### 9.3.2.3 到 Dify 上添加 JumpServer MCP
@@ -1721,10 +1713,16 @@ Bot：
 
 ### 部署 K8s MCP Server
 
+现成方案（都是真实活跃项目）：
+
+- `containers/kubernetes-mcp-server`（Go，原 manusa 项目，功能全）
+- `Flux159/mcp-server-kubernetes`（TypeScript，社区流行）
+
+也可以像下面这样用 FastMCP 自己写一个最小版——好处是工具面完全可控（只暴露你想给 AI 的能力）：
+
 ```bash
-git clone https://github.com/your-org/k8s-mcp-server.git /opt/k8s-mcp
-cd /opt/k8s-mcp
-pip install kubernetes mcp
+mkdir /opt/k8s-mcp && cd /opt/k8s-mcp
+pip install kubernetes "mcp[cli]"
 ```
 
 ```python
@@ -1733,7 +1731,8 @@ from mcp.server.fastmcp import FastMCP
 from kubernetes import client, config
 import json
 
-mcp = FastMCP("k8s-ops")
+# 端口在构造时传（FastMCP 的 run() 不接受 port 参数）
+mcp = FastMCP("k8s-ops", port=8871)
 config.load_kube_config()  # 或 config.load_incluster_config() 集群内
 v1 = client.CoreV1Api()
 apps_v1 = client.AppsV1Api()
@@ -1765,7 +1764,11 @@ def describe_pod(name: str, namespace: str = "default") -> dict:
         "status": pod.status.phase,
         "conditions": [{"type": c.type, "status": c.status} for c in pod.status.conditions or []],
         "containers": [{"name": c.name, "image": c.image} for c in pod.spec.containers],
-        "events": [{"reason": e.reason, "message": e.message} for e in pod.status.container_statuses or []],
+        "container_statuses": [
+            {"name": s.name, "ready": s.ready, "restarts": s.restart_count,
+             "waiting_reason": s.state.waiting.reason if s.state.waiting else None}
+            for s in pod.status.container_statuses or []
+        ],
     }
 
 @mcp.tool()
@@ -1808,12 +1811,14 @@ def get_nodes() -> list:
         "memory": n.status.capacity.get("memory", ""),
     } for n in nodes.items]
 
-mcp.run(transport="sse", port=8871)
+mcp.run(transport="sse")
 ```
 
 ```bash
 # 启动
 python k8s_mcp_server.py &
+# Dify 1.6+ 也支持 streamable-http 传输（mcp.run(transport="streamable-http")），
+# 新集成建议优先用它，SSE 是兼容老客户端的选项
 ```
 
 ### Dify 配置
@@ -1865,15 +1870,21 @@ Dify Agent → 接收告警 → 自动排查 → 返回诊断结果
 
 ```yaml
 # alertmanager.yml
+# 注意：Alertmanager 的 webhook payload 格式是固定的（alerts 数组等字段），
+# 而 Dify 的 /v1/workflows/run 要求 {"inputs": {...}, "user": "..."} 结构，
+# 两者不能直接对接——中间需要一层转换（常见做法：n8n 或一个小 Flask 适配器
+# 收 Alertmanager webhook，再改写成 Dify 的请求格式转发）。
 receivers:
   - name: 'dify-aiops'
     webhook_configs:
-      - url: 'http://<dify-ip>/v1/workflows/run'
+      - url: 'http://<adapter-ip>:5000/alert-to-dify'   # 指向转换层，不是直接指向 Dify
         send_resolved: true
-        http_config:
-          authorization:
-            credentials: 'Bearer app-xxxx'
         max_alerts: 5
+
+# 转换层再调 Dify：
+# POST http://<dify-ip>/v1/workflows/run
+# Authorization: Bearer app-xxxx
+# {"inputs": {"alert_info": "<整理后的告警文本>"}, "user": "alertmanager"}
 ```
 
 ### Dify 告警分析工作流
@@ -2118,9 +2129,11 @@ Dify 更适合：
 
 ### 部署 Ansible MCP Server
 
+社区没有一个"事实标准"的 Ansible MCP（搜到的多是个人实验仓库），这类薄封装自己写反而最可控——几十行 FastMCP 就够：
+
 ```bash
-git clone https://github.com/your-org/ansible-mcp.git /opt/ansible-mcp
-pip install mcp ansible-runner
+mkdir /opt/ansible-mcp && cd /opt/ansible-mcp
+pip install "mcp[cli]" ansible-runner
 ```
 
 ```python
@@ -2129,7 +2142,7 @@ from mcp.server.fastmcp import FastMCP
 import ansible_runner
 import json
 
-mcp = FastMCP("ansible-ops")
+mcp = FastMCP("ansible-ops", port=8872)
 
 INVENTORY = "/etc/ansible/hosts"
 
@@ -2207,7 +2220,7 @@ def restart_service(group: str, service: str) -> dict:
     
     return {"restarted": r2.stats["ok"], "failed": r2.stats["failures"]}
 
-mcp.run(transport="sse", port=8872)
+mcp.run(transport="sse")
 ```
 
 ### Dify 配置
@@ -2288,13 +2301,13 @@ curl -X POST "http://jenkins:8080/job/deploy-api/build" \
 类型：HTTP Request
 方法：POST
 URL：http://jenkins:8080/job/{job_name}/buildWithParameters
-认证：Basic Auth
-Body：
-  {
-    "BRANCH": "{{$json.ref}}",
-    "COMMIT_ID": "{{$json.after}}",
-    "AUTHOR": "{{$json.user_name}}"
-  }
+认证：Basic Auth（用户名 + API Token）
+参数传递：注意！buildWithParameters 接收的是查询参数/表单参数，
+         不是 JSON body（发 JSON 会被 Jenkins 忽略，构建拿到的全是默认值）
+Query Parameters：
+  BRANCH   = {{$json.ref}}
+  COMMIT_ID = {{$json.after}}
+  AUTHOR   = {{$json.user_name}}
 ```
 
 #### 节点 4：轮询 Jenkins 构建状态

@@ -52,7 +52,9 @@ LLM 输出（文字，无法执行）：
    }
 
 2. 你的程序收到这个 JSON → 执行真正的 kubectl 命令：
-   $ kubectl get pods -n prod --field-selector=status.phase!=Running
+   $ kubectl get pods -n prod --no-headers | awk '$3=="CrashLoopBackOff"'
+   （注意：CrashLoopBackOff 的 Pod 其 phase 是 Running，
+     用 --field-selector=status.phase!=Running 是查不到的，这是个常见错误）
    
 3. 命令结果喂回给模型：
    "PodA: CrashLoopBackOff (OOMKilled)
@@ -138,11 +140,12 @@ result = subprocess.run(
 )
 
 # 把执行结果喂回给模型，让它基于真实数据回答
+# 注意：assistant 回合要原样带上模型返回的 message（含 tool_calls），不能只塞 tool_call
 response = client.chat.completions.create(
     model="qwen3-8b",
     messages=[
         {"role": "user", "content": "查看一下生产环境有没有异常的 Pod"},
-        {"role": "assistant", "tool_calls": [tool_call]},
+        response.choices[0].message,
         {"role": "tool", "tool_call_id": tool_call.id, "content": result.stdout},
     ],
 )

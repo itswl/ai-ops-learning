@@ -1,6 +1,8 @@
 # OpenClaw 运维实战：从部署到 AIOps
 
-> 创建时间: 2026-05-07
+> 创建时间: 2026-05-07（2026-08 按真实项目重写勘误）
+
+> ⚠️ 勘误说明：本文早期版本把 OpenClaw 描述成一个"Django + Celery + PostgreSQL 的多 Agent 运维编排框架"，包括 `manage.py createsuperuser`、`team.yaml`、8800/8801 端口、企微/钉钉通道等内容，**全部是 AI 编造的，真实项目里不存在**。以下内容以官方文档（docs.openclaw.ai）为准重写。
 
 ---
 
@@ -8,584 +10,261 @@
 
 ### 是什么
 
-OpenClaw 是一个开源的**多 Agent 运维编排框架**，核心定位是「用自然语言驱动运维操作」。它将 LLM 和运维工具链深度整合，让运维工程师通过聊天就能完成机器管理、集群操作、监控查询、日志分析。
+OpenClaw 是 Peter Steinberger 开源的**个人 AI 助手网关**（前身叫 Clawdbot，2026 年 1 月因商标问题改名）。技术栈是 TypeScript/Node.js。它做的事情是：
+
+- 在你的机器上跑一个常驻 **Gateway** 进程；
+- 把 LLM Agent（默认 Claude 系，也支持其他 provider）接到你日常用的 IM 上；
+- Agent 拥有工作区、会话记忆、技能（Skills）和执行本机命令的能力。
+
+它**不是**一个运维产品，而是一个"带手脚的 AI 助手运行时"。对运维工程师的价值在于：Agent 能执行真实 CLI（kubectl / ansible / promtool / logcli ...），所以只要在一台配好运维工具链的跳板机上部署它，就能得到一个"在 IM 里聊天就能查集群、查监控、查日志"的运维助手——这一层是你自己用 Skills 和权限边界搭出来的，不是产品自带的。
 
 ### 和 Coze/FastGPT 的区别
 
 | | OpenClaw | Coze | FastGPT |
 |---|---|---|---|
-| **定位** | 运维 Agent 框架 | 通用 AI Bot 平台 | 知识库问答平台 |
-| **核心能力** | 多 Agent 协作 + 运维工具深度集成 | 插件 + 工作流编排 | RAG 知识库 |
-| **部署方式** | 自部署 | SaaS + 自部署 | 自部署 |
-| **运维友好度** | ★★★★★ 原生运维集成 | ★★★ 需要自定义插件 | ★★ 知识库为主 |
-| **多 Agent** | 原生支持 | 实验性 | 不支持 |
-| **适用场景** | 智能运维、自动化操作 | 通用对话机器人 | 知识库问答 |
+| **定位** | 个人 AI 助手网关（自托管） | 通用 AI Bot 平台 | 知识库问答平台 |
+| **核心能力** | IM 多通道接入 + 本机命令执行 + Skills | 插件 + 工作流编排 | RAG 知识库 |
+| **部署方式** | 自部署（你的机器/VM） | SaaS + 企业版 | 自部署 |
+| **执行真实命令** | ★★★★★ 原生（Agent 直接跑 shell） | 需要自己写插件调 API | 基本不涉及 |
+| **多 Agent** | 多 Agent 实例 + 消息路由（非编排） | 有多 Agent 模式 | 不支持 |
+| **风险面** | 高——Agent 有 shell，权限要自己收敛 | 低（沙箱内） | 低 |
+| **适用场景** | 个人/小团队 ChatOps、运维助手 | 面向业务的对话机器人 | 企业知识库问答 |
 
-### 核心架构
+### 真实架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    OpenClaw 平台                          │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │              Agent 协作层                          │   │
-│  │  指挥Agent + 诊断Agent + 日志Agent + 监控Agent     │   │
-│  └──────────────────────────────────────────────────┘   │
-│          ↓               ↓               ↓              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐          │
-│  │ 工具集成层│  │  IM 接入层│  │  知识库层     │          │
-│  │ Ansible  │  │ Telegram │  │  运维文档     │          │
-│  │ K8s      │  │ 飞书/企微 │  │  故障复盘     │          │
-│  │ Prometheus│ │ 钉钉     │  │  脚本库      │          │
-│  │ Loki     │  │ API      │  │  监控规则     │          │
-│  └──────────┘  └──────────┘  └──────────────┘          │
-└─────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│                      IM 通道层                           │
+│  Telegram │ 飞书 │ Slack │ Discord │ WhatsApp │ iMessage │
+│  Google Chat │ Mattermost │ MS Teams │ Signal            │
+│  （注意：不支持企业微信和钉钉，别按老版本文档去找）           │
+└───────────────────────┬────────────────────────────────┘
+                        │
+┌───────────────────────┴────────────────────────────────┐
+│              OpenClaw Gateway（常驻进程）                 │
+│  默认监听 127.0.0.1:18789（含 Control UI 网页控制台）      │
+│  ├── 消息路由：channel/账号/群 → 绑定到某个 Agent          │
+│  ├── Agent 运行时：会话、工作区、记忆                      │
+│  ├── Skills：按目录组织的能力包（SKILL.md）                │
+│  └── 定时任务（cron）：定点触发 Agent 干活                 │
+└───────────────────────┬────────────────────────────────┘
+                        │ Agent 执行本机命令
+┌───────────────────────┴────────────────────────────────┐
+│            这台机器上你准备好的运维工具链                   │
+│  kubectl（只读 kubeconfig）│ ansible │ promtool/curl      │
+│  logcli(Loki) │ 自定义脚本  │ MCP Server（可选扩展）       │
+└────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 10.2 OpenClaw 部署
 
-### 10.2.1 云主机部署
-
-#### 环境要求
+### 环境要求
 
 ```
-OS: Ubuntu 22.04+ / CentOS 8+
-CPU: 4 核+
-内存: 8GB+
-磁盘: 40GB+（Docker 镜像 + 日志）
-Docker: 24.0+
-Docker Compose: 2.20+
+OS: macOS / Linux（推荐一台专用小 VM 或跳板机）
+Node.js: 22+（安装脚本会处理）
+内存: 1-2GB 足够（它只是网关+Agent 运行时，模型在云端）
+安全前提: 这台机器上的凭证（kubeconfig、SSH key）就是 Agent 的权限边界
 ```
 
-#### 部署步骤
+### 部署步骤（真实命令）
 
 ```bash
-# 1. 安装 Docker
-curl -fsSL https://get.docker.com | bash
-sudo usermod -aG docker $USER
-# 重新登录生效
+# 1. 官方安装脚本（macOS/Linux）
+curl -fsSL https://openclaw.ai/install.sh | bash
 
-# 2. 克隆仓库
-git clone https://github.com/openclaw/openclaw.git /opt/openclaw
-cd /opt/openclaw
+# 2. 初始化向导：配置模型 API Key、连接第一个 IM 通道、
+#    并把 Gateway 注册为后台服务（launchd/systemd）
+openclaw onboard
 
-# 3. 配置环境变量
-cp .env.example .env
-vim .env
+# 3. 确认 Gateway 状态
+openclaw gateway status
+
+# 4. 自检（环境/配置/通道连通性）
+openclaw doctor
+
+# 5. 打开控制台（本机访问）
+# 浏览器打开 http://127.0.0.1:18789 —— Control UI，可视化改配置、看会话
 ```
 
-```bash
-# .env 关键配置
-# LLM 后端（OpenAI 兼容 API）
-OPENCLAW_LLM_BASE_URL=http://your-llm-server:8000/v1
-OPENCLAW_LLM_API_KEY=sk-xxx
-OPENCLAW_LLM_MODEL=qwen3-8b
+### 配置文件
 
-# 数据库
-OPENCLAW_DB_HOST=postgres
-OPENCLAW_DB_USER=openclaw
-OPENCLAW_DB_PASSWORD=changeme
-OPENCLAW_DB_NAME=openclaw
+配置在 `~/.openclaw/openclaw.json`（JSON5，允许注释；**schema 严格校验**，写了未知字段 Gateway 会拒绝启动）：
 
-# 加密密钥（用于存储敏感配置）
-OPENCLAW_SECRET_KEY=$(openssl rand -hex 32)
+```json5
+{
+  // 模型 provider（示例：Anthropic 为主，本地 vLLM 兜底可另配 openai 兼容端点）
+  models: {
+    providers: {
+      anthropic: { apiKey: "${ANTHROPIC_API_KEY}" },
+    },
+  },
 
-# 日志级别
-OPENCLAW_LOG_LEVEL=INFO
-```
+  // Agent：工作区就是它的"家目录"
+  agents: {
+    defaults: {
+      workspace: "~/.openclaw/workspace",
+    },
+    entries: {
+      main: { default: true },
+    },
+  },
 
-```bash
-# 4. 启动服务
-docker-compose up -d
-
-# 5. 检查服务
-docker-compose ps
-# openclaw-web       — Web UI (端口 8800)
-# openclaw-api       — API 服务 (端口 8801)
-# openclaw-worker    — 后台任务处理
-# postgres           — 数据库
-# redis              — 消息队列
-
-# 6. 验证
-curl http://localhost:8801/api/health
-# {"status": "ok"}
-```
-
-```bash
-# 7. 初始化管理员账号
-docker exec -it openclaw-api python manage.py createsuperuser
-# Username: admin
-# Password: ******
-
-# 8. Nginx 反代（可选）
-cat > /etc/nginx/sites-available/openclaw << 'NGINX'
-server {
-    listen 80;
-    server_name openclaw.your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8800;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:8801;
-        proxy_set_header Host $host;
-    }
+  // 通道：每个 IM 一个小节，白名单是第一道安全线
+  channels: {
+    telegram: {
+      botToken: "${TELEGRAM_BOT_TOKEN}",
+      // 只允许这些账号跟它说话
+      allowFrom: ["@your_username"],
+    },
+  },
 }
-NGINX
-
-ln -s /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/
-nginx -t && nginx -s reload
 ```
 
----
-
-### 10.2.2 本地部署
-
-```bash
-# 1. 前置依赖
-# macOS
-brew install python@3.12 node@20 postgresql@16 redis
-
-# Ubuntu
-sudo apt install python3.12 nodejs postgresql redis-server
-
-# 2. 创建 Python 虚拟环境
-python3.12 -m venv /opt/openclaw/venv
-source /opt/openclaw/venv/bin/activate
-
-# 3. 安装依赖
-cd /opt/openclaw
-pip install -r requirements.txt
-npm install --prefix frontend
-
-# 4. 初始化数据库
-createdb openclaw
-python manage.py migrate
-
-# 5. 构建前端
-cd frontend && npm run build && cd ..
-
-# 6. 启动各组件（开发模式）
-# 终端 1：API 服务
-python manage.py runserver 0.0.0.0:8801
-
-# 终端 2：Worker
-celery -A openclaw worker -l info
-
-# 终端 3：Web
-cd frontend && npm run dev -- --port 8800
-```
+> 安全提醒：Gateway 只应监听 127.0.0.1。需要远程管理就走 SSH 隧道或 Tailscale，**永远不要**把 18789 端口暴露到公网。
 
 ---
 
 ## 10.3 OpenClaw 接入聊天工具
 
-### 统一配置入口
+支持的通道（2026-08 官方列表）：Telegram、飞书（Feishu）、Slack、Discord、WhatsApp、iMessage、Google Chat、Mattermost、Microsoft Teams、Signal。
 
-所有 IM 接入在 OpenClaw Web UI 中统一管理：
-
-```
-OpenClaw → 设置 → 通道管理 → 添加通道
-```
-
-每个通道配置完成后，用户在对应 IM 工具中 @机器人 即可与 Agent 交互。
-
----
+> 国内环境注意：**企业微信、钉钉没有官方通道**。要接入这两个，得自己写桥接（比如企微回调 → 转发到 OpenClaw 的 API/一个自建通道），或干脆选飞书/Telegram。
 
 ### 10.3.1 接入 Telegram
 
 ```bash
-# 1. 在 Telegram 创建 Bot
-# 搜 @BotFather → /newbot → 填名称 → 获得 Token
-# 示例 Token: 7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# 1. Telegram 里找 @BotFather → /newbot → 拿到 Bot Token
 
-# 2. OpenClaw Web UI 配置
-通道类型：Telegram
-Bot Token：7123456789:AAHxxx...
-代理模式：Webhook（推荐）或 Polling
+# 2. 写入配置 ~/.openclaw/openclaw.json
+#    channels.telegram.botToken = "7123456789:AAH..."
+#    channels.telegram.allowFrom = ["@你的用户名"]
 
-# 3. 如果选 Webhook，需要配置 Nginx 反代
-# Telegram 要求 Webhook URL 使用 HTTPS
+# 3. 重载配置（Gateway 会热加载合法配置）后，
+#    Telegram 里给 Bot 发消息即可。首次陌生账号会走配对确认，防止路人使唤你的 Agent
 ```
-
-```
-curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://openclaw.your-domain.com/api/channels/telegram/webhook"
-```
-
-配置完成后在 Telegram 中搜索你的 Bot，发送 `/start` 即可开始对话。
-
----
 
 ### 10.3.2 接入飞书
 
+飞书是官方支持的通道，流程和所有飞书自建应用一致：
+
 ```
-飞书开放平台 → 创建应用 → 企业自建应用
-
-第 1 步：创建应用
-  名称：OpenClaw 运维助手
-  描述：智能运维机器人
-
-第 2 步：添加能力
-  ├── 机器人（启用）
-  └── 事件订阅
-      请求网址：https://openclaw.your-domain.com/api/channels/feishu/event
-      订阅事件：
-        im.message.receive_v1（接收消息）
-        im.message.send_v1（发送消息）
-
-第 3 步：获取凭证
-  App ID：cli_axxxxx
-  App Secret：xxxxxx
-  Verification Token：xxxxxx
-
-第 4 步：OpenClaw Web UI 配置
-  通道类型：飞书
-  App ID：cli_axxxxx
-  App Secret：xxxxxx
-  Verification Token：xxxxxx
-
-第 5 步：发布
-  飞书开放平台 → 版本管理 → 创建版本 → 发布
-  管理员审批后在飞书中搜索应用名称即可使用
+第 1 步：飞书开放平台 → 创建企业自建应用
+第 2 步：开通机器人能力，订阅 im.message.receive_v1 事件
+第 3 步：拿到 App ID / App Secret，填进 openclaw.json 的 channels.feishu 小节
+第 4 步：事件回调地址指向你的 Gateway（内网部署时用官方推荐的长连接/代理方式）
+第 5 步：发布应用，在飞书里 @机器人 对话
 ```
 
-**飞书卡片消息示例**（OpenClaw 内置支持）：
+（具体字段名以 docs.openclaw.ai 的 Feishu 通道页为准，飞书侧的凭证概念——App ID/Secret/事件订阅——和你配其他飞书机器人没有任何区别。）
 
-```json
+**飞书卡片消息**：OpenClaw 的回复是文本/Markdown 为主。要做"按钮确认"类交互（比如下文的高危操作审批），用文本确认词（"确认执行"/"取消"）最可靠，别指望它原生发复杂交互卡片。
+
+---
+
+## 10.4 多 Agent：路由隔离，而不是编排
+
+真实的 OpenClaw 多 Agent 模型是：**多个 Agent 实例，各自独立的工作区和会话，用路由规则决定"哪条消息进哪个 Agent"**。它不是 CrewAI 那种"指挥 Agent 拆解任务分派给专业 Agent"的编排框架——那类编排要靠 LangGraph 等外部框架自己搭。
+
+对运维场景，这个模型反而更实用——按**权限边界**切 Agent：
+
+```json5
 {
-  "msg_type": "interactive",
-  "card": {
-    "header": {
-      "title": {"tag": "plain_text", "content": "故障排查结果"},
-      "template": "red"
-    },
-    "elements": [
-      {
-        "tag": "div",
-        "text": {"tag": "lark_md", "content": "**根因**：web-01 的 Java 进程 GC 频繁引发 CPU 飙高\n\n**建议**：调大堆内存至 4G 并重启"}
+  agents: {
+    defaults: { workspace: "~/.openclaw/workspace" },
+    entries: {
+      // 个人助手：全能力，只有你自己私聊能用
+      main: { default: true },
+
+      // 运维只读助手：绑定到运维群，工作区里只有只读 kubeconfig、
+      // 只读的 Prometheus/Loki 查询脚本，皮肤是"值班助手"
+      "ops-readonly": {
+        workspace: "~/.openclaw/ops-readonly",
+        // 用 skills 白名单收敛能力（省略 = 不限制，[] = 全禁）
+        skills: ["k8s-readonly", "prom-query", "loki-query"],
       },
-      {
-        "tag": "action",
-        "actions": [
-          {"tag": "button", "text": {"tag": "plain_text", "content": "确认重启"}, "type": "primary"},
-          {"tag": "button", "text": {"tag": "plain_text", "content": "先查看日志"}, "type": "default"}
-        ]
-      }
-    ]
-  }
+    },
+  },
+  // 路由绑定：运维群的消息 → ops-readonly；你的私聊 → main
+  // （bindings 的具体写法以官方 configuration-reference 为准）
 }
 ```
 
----
-
-### 10.3.3 接入企业微信
-
-```
-企业微信管理后台 → 应用管理 → 创建应用
-
-第 1 步：创建应用
-  应用名称：OpenClaw 运维助手
-  Logo：上传一个运维图标
-
-第 2 步：获取凭证
-  Corp ID（企业 ID）：ww1234567890abcdef
-  Agent ID：1000001
-  Secret：xxxxxx
-
-第 3 步：配置接收消息
-  URL：https://openclaw.your-domain.com/api/channels/wecom/callback
-  Token：随机字符串（OpenClaw 生成）
-  EncodingAESKey：随机 43 位字符串
-
-第 4 步：OpenClaw Web UI 配置
-  通道类型：企业微信
-  Corp ID：ww1234567890abcdef
-  Agent ID：1000001
-  Secret：xxxxxx
-  Token：和上一步一致
-  EncodingAESKey：和上一步一致
-
-第 5 步：设置可信 IP
-  企业微信管理后台 → 应用管理 → 企业可信 IP
-  添加 OpenClaw 服务器的公网 IP
-```
-
-**企业微信特有的交互设计**：
-
-```
-企业微信机器人适合「消息卡片 + 按钮」交互模式：
-
-用户：@OpenClaw 帮我查所有机器状态
-
-Bot 卡片回复：
-┌─────────────────────────────────┐
-│ 📊 当前 8 台机器状态             │
-│                                 │
-│ ✅ 7 台正常运行                   │
-│ 🔴 1 台异常 (web-03 CPU 92%)    │
-│                                 │
-│ [查看详情] [排查 web-03]         │
-└─────────────────────────────────┘
-```
-
----
-
-### 10.3.4 接入钉钉
-
-```
-钉钉开放平台 → 创建应用 → 企业内部应用
-
-第 1 步：创建应用
-  应用类型：机器人
-  开发模式：Stream 模式（推荐，无需公网 IP）
-
-第 2 步：获取凭证
-  App Key：dingxxxxxxxxx
-  App Secret：xxxxxx
-
-第 3 步：权限配置
-  ├── 企业内机器人发送消息
-  └── 接收消息
-
-第 4 步：OpenClaw Web UI 配置
-  通道类型：钉钉
-  App Key：dingxxxxxxxxx
-  App Secret：xxxxxx
-  连接模式：Stream（推荐）
-
-第 5 步：发布
-  版本管理与发布 → 创建版本 → 发布
-  企业内搜索机器人名称即可使用
-```
-
-**钉钉 Stream 模式优势**：
-
-```
-无需公网 IP 和 HTTPS 证书
-钉钉主动推消息 → OpenClaw 本地接收
-适合内网环境部署
-```
-
----
-
-## 10.4 OpenClaw 多 Agent 协作
-
-### Agent 协作架构
-
-```
-          ┌─────────────────────┐
-          │  指挥 Agent          │
-          │  (Orchestrator)     │
-          │  接收请求→分配任务→汇总 │
-          └──────┬──────────────┘
-                 │
-    ┌────────────┼────────────┬──────────────┐
-    ↓            ↓             ↓              ↓
-┌────────┐ ┌─────────┐ ┌──────────┐ ┌──────────┐
-│诊断    │ │监控     │ │日志      │ │操作      │
-│Agent   │ │Agent    │ │Agent     │ │Agent     │
-│        │ │         │ │          │ │          │
-│Ansible │ │Prometheus│ │Loki     │ │K8s      │
-│ping/ssh│ │Grafana  │ │grep     │ │kubectl  │
-└────────┘ └─────────┘ └──────────┘ └──────────┘
-```
-
-### 配置多 Agent
-
-```yaml
-# openclaw/agents/team.yaml
-# Agent 团队配置
-
-team:
-  name: ops-team
-  description: "运维响应团队"
-
-  orchestrator:
-    name: commander
-    model: qwen3-8b
-    system_prompt: |
-      你是运维指挥 Agent，负责：
-      1. 分析用户请求，拆解为子任务
-      2. 将子任务分配给最合适的专业 Agent
-      3. 汇总各 Agent 的结果，形成统一回复
-      4. 如果某个 Agent 的结果不够，重新分配任务
-      
-      可用的专业 Agent：
-      - diagnostics：故障诊断（Ansible 操作、SSH 检查）
-      - monitor：监控查询（Prometheus 指标、Grafana 面板）
-      - logs：日志分析（Loki 查询、异常模式匹配）
-      - operator：运维操作（K8s 管理、服务重启）
-
-  agents:
-    diagnostics:
-      name: 诊断工程师
-      model: qwen3-8b
-      system_prompt: |
-        你是故障诊断专家，使用 Ansible 和 SSH 进行主机级排查。
-        可用工具：ansible_ping, ansible_shell, ansible_copy, ssh_exec
-      
-    monitor:
-      name: 监控分析师
-      model: qwen3-8b
-      system_prompt: |
-        你是监控专家，使用 Prometheus 查询指标并分析趋势。
-        可用工具：promql_query, promql_range, get_alerts, get_rules
-      
-    logs:
-      name: 日志分析师
-      model: qwen3-8b
-      system_prompt: |
-        你是日志分析专家，使用 Loki 检索和解析日志。
-        可用工具：loki_query, loki_stats, log_pattern_match
-      
-    operator:
-      name: 操作工程师
-      model: qwen3-8b
-      system_prompt: |
-        你是 K8s 运维操作专家。
-        可用工具：kubectl_get, kubectl_describe, kubectl_logs,
-                 kubectl_rollout, kubectl_scale, helm_list, helm_status
-```
-
-### Agent 协作流程示例
-
-```
-用户：「生产环境 API 服务 502 了，帮我查一下」
-
-指挥Agent 拆解：
-  ├── 子任务1 → 监控Agent: "查 API 服务的 QPS 和错误率最近 15 分钟趋势"
-  ├── 子任务2 → 日志Agent: "查 API 服务 502 相关日志"
-  └── 子任务3 → 诊断Agent: "查 API 服务器 CPU 和内存情况"
-
-各Agent 返回结果：
-  监控Agent: "QPS 正常，但 502 错误率从 14:30 跳到 30%"
-  日志Agent: "nginx error.log 显示 upstream 10.0.1.50:8080 connect() failed"
-  诊断Agent: "10.0.1.50 CPU 100%，java 进程 OOMKilled"
-
-指挥Agent 汇总：
-  "根因：后端服务 10.0.1.50 上的 Java 进程 OOMKilled，
-   导致 upstream 不可达，nginx 返回 502。
-   建议：1. 先切流量到备用节点 2. 重启故障服务 3. 调大 JVM 堆内存"
-```
+这样"运维群里任何人都能问，但只能查不能改；改的能力只在你私聊的 main Agent 里"——权限模型是靠**Agent 隔离 + 工作区里放什么凭证**实现的，比 prompt 里写"你不许执行危险命令"可靠得多。
 
 ---
 
 ## 10.5 OpenClaw 实战
 
-### 实战：一键环境巡检
+### Skills：把巡检流程做成能力包
 
-```yaml
-# openclaw/skills/env_health_check.yaml
-# 注册为一个 Skill，可通过自然语言触发
+OpenClaw 的 Skill 遵循 AgentSkills 约定：工作区 `skills/` 下一个目录 + `SKILL.md`（说明什么时候用、怎么用）+ 附带脚本。Agent 会按需读取并执行。
 
-skill:
-  name: env_health_check
-  triggers:
-    - "环境巡检"
-    - "健康检查"
-    - "帮我看看所有机器"
-    
-  workflow:
-    - step: check_connectivity
-      agent: diagnostics
-      action: ansible_ping
-      target: all
-      description: "检查所有机器连通性"
-      
-    - step: check_resources
-      agent: monitor
-      action: batch_query
-      queries:
-        - "100 - (avg(rate(node_cpu_seconds_total{mode='idle'}[5m])) * 100) > 80"
-        - "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 80"
-        - "100 - (node_filesystem_avail_bytes{fstype!='tmpfs'} / node_filesystem_size_bytes) * 100 > 80"
-      description: "检查 CPU/内存/磁盘使用率"
-      
-    - step: check_services
-      agent: operator
-      action: kubectl_get_pods
-      params:
-        all_namespaces: true
-        field_selector: "status.phase!=Running"
-      description: "检查 K8s 异常 Pod"
-      
-    - step: check_recent_alerts
-      agent: monitor
-      action: get_alerts
-      params:
-        since: 1h
-      description: "查看最近 1 小时告警"
-      
-    - step: generate_report
-      agent: commander
-      prompt: |
-        汇总以下巡检结果，生成健康报告：
-        连通性：{{steps.check_connectivity.output}}
-        资源状态：{{steps.check_resources.output}}
-        服务状态：{{steps.check_services.output}}
-        告警情况：{{steps.check_recent_alerts.output}}
-        
-        报告格式：
-        ## 环境巡检报告
-        ### 概览
-        健康度：X/N 台正常
-        
-        ### 异常项
-        - [严重] xxx
-        - [警告] xxx
-        
-        ### 建议
-        1. xxx
+```
+~/.openclaw/ops-readonly/skills/env-health-check/
+├── SKILL.md
+└── scripts/
+    ├── check_nodes.sh      # kubectl get nodes / top nodes
+    ├── check_pods.sh       # 异常 Pod 扫描
+    ├── check_alerts.sh     # curl Alertmanager /api/v2/alerts
+    └── check_capacity.sh   # PromQL：CPU/内存/磁盘水位
+```
+
+```markdown
+<!-- SKILL.md 示例 -->
+---
+name: env-health-check
+description: 生产环境例行巡检。用户说"巡检"/"健康检查"/"看看环境"时使用。
+---
+
+# 环境巡检
+
+按顺序执行 scripts/ 下的四个脚本，汇总为一份报告：
+
+1. check_nodes.sh —— 节点 Ready 状态与资源水位
+2. check_pods.sh —— 非 Running/未就绪 Pod 清单
+3. check_alerts.sh —— 当前活跃告警
+4. check_capacity.sh —— CPU/内存/磁盘超过 80% 的节点
+
+报告格式：
+## 环境巡检报告
+### 概览（健康度：X/N 正常）
+### 异常项（[严重]/[警告] 分级）
+### 建议
+所有结论必须来自脚本输出，不允许推测。
 ```
 
 **触发方式**：
 
 ```
-# 方式1：任意 IM 渠道直接说
+# 方式1：任意已接通道里直接说
 "做一次环境巡检"
 
-# 方式2：定时任务
-OpenClaw → 定时任务 → 添加
-  cron: "0 */4 * * *"  # 每 4 小时
-  skill: env_health_check
-  通知渠道: 运维群
+# 方式2：内置定时任务（cron），到点让 Agent 执行并把报告发到指定通道
+openclaw cron add --schedule "0 */4 * * *" --prompt "执行环境巡检并输出报告"
 
-# 方式3：API 调用
-curl -X POST https://openclaw.your-domain.com/api/skills/run \
-  -H "Authorization: Bearer $OPENCLAW_API_KEY" \
-  -d '{"skill": "env_health_check"}'
+# 具体 cron 子命令参数以 openclaw cron --help 为准
 ```
 
 ---
 
 ## 10.6 OpenClaw 与 AIOps
 
-### 10.6.1 OpenClaw + Ansible 管理 Linux 主机
+核心思想只有一句话：**OpenClaw 负责"嘴和手"，运维能力来自这台机器上你配好的工具链，安全来自你给这台机器的凭证权限**。以下集成全部是"在 Agent 所在机器上装好 CLI + 用 Skill 教会它用法"，没有任何平台级魔法。
 
-#### 集成配置
+### 10.6.1 + Ansible：管 Linux 主机
 
 ```bash
-# OpenClaw 服务器上安装 Ansible
+# Agent 所在机器上装 Ansible，配好清单
 pip install ansible
 
-# 配置主机清单
 cat > /etc/ansible/hosts << 'EOF'
 [web]
 web-01 ansible_host=10.0.1.10
 web-02 ansible_host=10.0.1.11
 web-03 ansible_host=10.0.1.12
-
-[db]
-db-master ansible_host=10.0.2.10
-db-slave ansible_host=10.0.2.11
 
 [all:vars]
 ansible_user=ops
@@ -593,404 +272,108 @@ ansible_ssh_private_key_file=/home/openclaw/.ssh/id_rsa
 EOF
 ```
 
-```yaml
-# openclaw/tools/ansible_tools.yaml
-tools:
-  ansible_ping:
-    description: "检查指定主机组的连通性"
-    command: "ansible {group} -m ping"
-    
-  ansible_shell:
-    description: "在目标主机上执行 shell 命令"
-    command: 'ansible {group} -m shell -a "{command}"'
-    # 安全白名单
-    allowed_commands:
-      - "df -h"
-      - "free -m"
-      - "uptime"
-      - "ps aux.*"
-      - "ss -tlnp"
-      - "systemctl status .*"
-      - "tail -n \d+ .*"
-      - "cat /proc/loadavg"
-    # 禁止危险操作
-    blocked_patterns:
-      - "rm -rf"
-      - "mkfs"
-      - "dd if="
-      - "> /dev/"
-      - "iptables"
-      - "shutdown"
-      - "reboot"
-      - "init [0-6]"
-    
-  ansible_facts:
-    description: "获取主机详细信息（CPU/内存/磁盘/网络）"
-    command: "ansible {group} -m setup"
-    
-  ansible_copy:
-    description: "推送文件到目标主机"
-    command: "ansible {group} -m copy -a 'src={src} dest={dest}'"
+安全边界（重要，顺序就是优先级）：
 
-  ansible_script:
-    description: "在目标主机执行脚本"
-    command: "ansible {group} -m script -a '{script_path}'"
+```
+1. SSH 层：给 Agent 用的 ops 账号在目标机上不给 sudo，
+   或 sudoers 只放行 systemctl status/journalctl 等只读命令
+2. Skill 层：SKILL.md 里写明只允许 df/free/uptime/ss/systemctl status 类只读命令，
+   写操作必须先输出计划、等用户回复"确认执行"
+3. 通道层：allowFrom 白名单 + 群里用只读 Agent
+不要指望第 2 层单独兜底——prompt 约束挡不住注入，硬边界永远在第 1 层。
 ```
 
-#### 智能主机管理对话示例
+对话效果（真实交互模式示意）：
 
 ```
 用户：帮我看看 web 组所有机器的磁盘使用情况
 
-Bot：
-（Ansible Agent 执行 ansible web -m shell -a "df -h"）
+Agent：（执行 ansible web -m shell -a "df -h /"）
+| 机器 | 总量 | 已用 | 使用率 |
+|------|------|------|--------|
+| web-01 | 40G | 15G | 37% |
+| web-02 | 40G | 32G | 80% ⚠️ |
+| web-03 | 40G | 38G | 95% 🔴 |
 
-| 机器 | 磁盘 | 总量 | 已用 | 可用 | 使用率 |
-|------|------|------|------|------|--------|
-| web-01 | /dev/vda1 | 40G | 15G | 25G | 37% |
-| web-02 | /dev/vda1 | 40G | 32G | 8G | 80% ⚠️ |
-| web-03 | /dev/vda1 | 40G | 38G | 2G | 95% 🔴 |
+web-03 磁盘 95%，要我看看是什么占的吗？
 
-⚠️ web-03 磁盘使用率 95%，建议清理日志。
-需要我帮你查 web-03 上哪些文件占用最大吗？
-
----
-用户：查一下
-
-Bot：
-（Ansible Agent 执行 ansible web-03 -m shell -a "du -sh /* 2>/dev/null | sort -rh | head -10"）
-
-| 目录 | 大小 |
-|------|------|
-| /var | 18G |
-| /usr | 8.2G |
-| /home | 5.1G |
-| /opt | 3.8G |
-
-进一步分析 /var 目录：
-/var/log/nginx/access.log 占用 12G（最近 30 天未轮转）
-
-建议：执行 logrotate 清理，需要我帮你执行吗？
+用户：查
+Agent：（执行 ansible web-03 -m shell -a "du -xh /var 2>/dev/null | sort -rh | head"）
+/var/log/nginx/access.log 占 12G，30 天没轮转。
+建议配置 logrotate。这是写操作，需要你确认后我再执行。
 ```
 
----
+### 10.6.2 + Kubernetes：智能 K8s 排障
 
-### 10.6.2 OpenClaw + Kubernetes 做智能 K8s 管理平台
-
-#### 集成配置
-
-```yaml
-# openclaw/tools/k8s_tools.yaml
-tools:
-  kubectl_get:
-    description: "获取 K8s 资源列表"
-    command: "kubectl get {resource} -n {namespace} {extra_flags}"
-    
-  kubectl_describe:
-    description: "查看 K8s 资源详情"
-    command: "kubectl describe {resource} {name} -n {namespace}"
-    
-  kubectl_logs:
-    description: "查看 Pod 日志"
-    command: "kubectl logs {pod_name} -n {namespace} --tail={lines}"
-    
-  kubectl_events:
-    description: "查看命名空间事件"
-    command: "kubectl get events -n {namespace} --sort-by='.lastTimestamp'"
-    
-  kubectl_top:
-    description: "查看资源使用"
-    command: "kubectl top {resource} -n {namespace}"
-    
-  kubectl_rollout:
-    description: "查看/管理滚动更新"
-    command: "kubectl rollout {action} deployment/{name} -n {namespace}"
-    # 变更操作需要确认
-    requires_confirmation: true
-    
-  kubectl_scale:
-    description: "扩缩容"
-    command: "kubectl scale deployment/{name} --replicas={count} -n {namespace}"
-    requires_confirmation: true
-    
-  helm_list:
-    description: "列出 Helm Release"
-    command: "helm list -n {namespace}"
-    
-  helm_status:
-    description: "查看 Helm Release 详情"
-    command: "helm status {release} -n {namespace}"
-    
-  k8s_diagnose:
-    description: "自动诊断 K8s 资源异常"
-    # 这是一个组合命令，内部执行一组检查
-    checks:
-      - "kubectl get pods -n {namespace} --field-selector=status.phase!=Running"
-      - "kubectl get events -n {namespace} --sort-by='.lastTimestamp' | tail -20"
-      - "kubectl top pods -n {namespace}"
-      - "kubectl describe nodes | grep -A5 'Conditions:'"
+```bash
+# 关键在 kubeconfig 的权限，而不在工具本身：
+# 给 Agent 一个只读 ServiceAccount
+kubectl create serviceaccount openclaw-readonly -n ops
+kubectl create clusterrolebinding openclaw-view \
+  --clusterrole=view --serviceaccount=ops:openclaw-readonly
+# 用这个 SA 的 token 生成 kubeconfig，放进 Agent 工作区
+# （view 角色天然看不了 Secret 内容之外的敏感写口，扩缩容/删 Pod 一律 Forbidden）
 ```
 
-#### 智能 K8s 对话示例
+对话效果：
 
 ```
 用户：帮我看下 prod 命名空间有没有异常
 
-Bot：
-（Operator Agent 执行 kubectl get pods -n prod）
+Agent：（kubectl get pods -n prod）
+api-gateway-9x2h 处于 CrashLoopBackOff（重启 128 次）。继续排查：
+（kubectl describe pod ... → Last State: OOMKilled）
+（kubectl logs --previous → 启动时连接 Redis 超时）
+（kubectl get endpointslice -l kubernetes.io/service-name=redis -n prod → 无就绪后端）
 
-prod 命名空间概览：
-| Pod | 状态 | 重启 | 运行时间 |
-|-----|------|------|----------|
-| api-gateway-7d4f | Running | 0 | 3d |
-| api-gateway-9x2h | CrashLoopBackOff 🔴 | 128 | 5m |
-| user-svc-5k3m | Running | 1 | 2d |
-| order-svc-8p2n | Running | 0 | 7d |
-
-发现异常：api-gateway-9x2h 处于 CrashLoopBackOff。
-自动排查中...
-
-（Operator Agent 自动执行）：
-1. kubectl describe pod api-gateway-9x2h
-   → Last State: Terminated (OOMKilled)
-2. kubectl logs api-gateway-9x2h --tail=50
-   → 日志显示启动时连接 Redis 超时
-3. kubectl get svc redis -n prod
-   → redis 服务存在，但 Endpoint 为空
-
-📊 诊断结论：
-Redis Service 的 Endpoint 为空，说明没有健康的 Redis Pod。
-api-gateway 因为连不上 Redis 而启动失败。
-
-🔧 建议：检查 Redis Pod 状态，可能需要重建。
-输入"修复"让我自动处理。
-
----
-用户：修复
-
-Bot：
-⚠️ 即将执行：
-  1. kubectl delete pod redis-0 -n prod（重建 Redis Pod）
-  2. 等待 Redis Ready
-  3. kubectl delete pod api-gateway-9x2h（触发重新调度）
-  [确认] [取消]
-
-用户：确认
-
-Bot：
-执行中...
-✅ Redis Pod 已重建 (Running)
-✅ api-gateway Pod 重建后正常运行
-✅ 健康检查通过
-
-问题已解决。耗时 42 秒。
+诊断：Redis Service 没有健康后端，api-gateway 启动即失败；
+容器又因内存超限被 OOMKill，两个问题叠加。
+我的 kubeconfig 是只读的，修复动作（重建 Redis Pod）请值班同学执行，
+或切到有写权限的 Agent 走审批流程。
 ```
+
+这里的关键设计：**"只读诊断"和"可写修复"物理分离**（两个 Agent、两份 kubeconfig），修复动作永远带"计划 → 人工确认 → 执行 → 复验"四步。
+
+### 10.6.3 + Prometheus/Alertmanager：告警分析
+
+```bash
+# 不需要专门的"集成插件"，HTTP API + curl/jq 就是全部：
+# 活跃告警
+curl -s http://alertmanager:9093/api/v2/alerts | jq '.[] | {alertname: .labels.alertname, severity: .labels.severity}'
+# 即时查询
+curl -s 'http://prometheus:9090/api/v1/query?query=up==0'
+# 范围查询（趋势）
+curl -s 'http://prometheus:9090/api/v1/query_range?query=rate(http_requests_total{code=~"5.."}[5m])&start=...&end=...&step=60'
+```
+
+把常用 PromQL 封装成脚本放进 Skill，让 Agent 做"告警 → 关联指标 → 时间线 → 结论"的分析。要求它：结论必须引用查询结果，不足以判断就明说。
+
+### 10.6.4 + Loki：日志分析
+
+```bash
+# logcli 是最顺手的接口
+logcli query '{namespace="prod", level="error"}' --since=1h --limit=200
+# 或 HTTP API
+curl -G http://loki:3100/loki/api/v1/query_range \
+  --data-urlencode 'query={namespace="prod"} |= "error"' \
+  --data-urlencode 'since=1h'
+```
+
+Skill 里可以预置常见错误模式（OOM / Connection refused / No space left / NXDOMAIN / certificate expired），让 Agent 先跑模式匹配再做自由分析，比裸看日志省 token 也稳定。
 
 ---
 
-### 10.6.3 OpenClaw + Prometheus 做智能监控告警
-
-#### 集成配置
-
-```yaml
-# openclaw/tools/prometheus_tools.yaml
-tools:
-  promql_query:
-    description: "执行单个 PromQL 即时查询"
-    endpoint: "http://prometheus:9090/api/v1/query"
-    
-  promql_range:
-    description: "执行 PromQL 范围查询"
-    endpoint: "http://prometheus:9090/api/v1/query_range"
-    
-  get_alerts:
-    description: "获取当前活跃告警"
-    endpoint: "http://alertmanager:9093/api/v2/alerts"
-    params:
-      active: true
-      silenced: false
-      inhibited: false
-      
-  get_rules:
-    description: "获取告警规则列表"
-    endpoint: "http://prometheus:9090/api/v1/rules"
-    
-  get_targets:
-    description: "获取 Prometheus 采集目标状态"
-    endpoint: "http://prometheus:9090/api/v1/targets"
-
-  analyze_metric:
-    description: "分析指标异常"
-    # 组合查询：当前值 + 同比 + 环比
-    actions:
-      - promql_range: "{metric}[15m]"
-      - promql_range: "{metric} offset 1d[15m]"  # 昨天同时段
-      - promql_range: "{metric}[1h]"               # 更长趋势
-```
-
-#### 智能告警分析对话
+## 安全清单（自托管 Agent 的命门）
 
 ```
-用户：最近 1 小时有什么告警？帮分析一下
-
-Bot：
-（Monitor Agent 查询 Alertmanager）
-
-活跃告警（2 条）：
-
-🔴 严重 | 14:32 至今
-  API 服务 P95 延迟 > 2s
-  当前值：3.8s（阈值 2s）
-  
-🟡 警告 | 14:15 至今
-  数据库连接数 > 80%
-  当前值：92%（阈值 80%）
-
-深入分析中...
-
-（Monitor Agent 自动执行关联分析）：
-1. API 延迟和 DB 连接数同时上涨 → 可能存在关联
-2. 查 DB 慢查询：
-   PromQL: rate(mysql_slow_queries[5m])
-   结果：慢查询从 14:10 开始增加
-3. 查 API QPS：
-   PromQL: rate(http_requests_total[5m])
-   结果：QPS 无明显变化，排除流量突增
-
-📊 分析结论：
-DB 慢查询激增 → 连接池拥挤 → API 等待 DB 响应 → P95 延迟上升
-
-🔧 建议排查：
-1. 检查最近的 DB 变更（索引变更？大事务？）
-2. 查看是否有慢查询阻塞了其他连接
-3. 必要时 Kill 慢查询 + 优化 SQL
-
-需要我帮你查看慢查询详情吗？
-```
-
----
-
-### 10.6.4 OpenClaw + Loki 做智能日志平台
-
-#### 集成配置
-
-```yaml
-# openclaw/tools/loki_tools.yaml
-tools:
-  loki_query:
-    description: "查询 Loki 日志"
-    endpoint: "http://loki:3100/loki/api/v1/query_range"
-    
-  loki_stats:
-    description: "统计日志量（按级别/服务/时间）"
-    endpoint: "http://loki:3100/loki/api/v1/query"
-    
-  log_pattern_match:
-    description: "匹配已知错误模式"
-    patterns:
-      - name: OOM
-        regex: "OutOfMemoryError|OOMKilled|memory limit"
-      - name: connection_error
-        regex: "Connection refused|connection timeout|Connection reset"
-      - name: disk_full
-        regex: "No space left on device|disk full"
-      - name: permission_denied
-        regex: "Permission denied|EACCES"
-      - name: DNS_failure
-        regex: "Name or service not known|no such host|NXDOMAIN"
-      - name: TLS_error
-        regex: "certificate expired|certificate verify failed|SSL_ERROR"
-
-  log_correlation:
-    description: "关联分析多个服务的日志"
-    # 同时查多个服务的日志，按时间轴对齐
-```
-
-#### 智能日志对话示例
-
-```
-用户：帮我查一下 14:30 左右的 ERROR 日志，看看发生了什么
-
-Bot：
-（Logs Agent 查询 Loki）
-
-14:25-14:35 ERROR 日志汇总：
-
-| 时间 | 服务 | 错误 | 数量 |
-|------|------|------|------|
-| 14:28 | api-gateway | Connection refused | 12 |
-| 14:29 | user-svc | Redis timeout | 8 |
-| 14:30 | api-gateway | 502 Bad Gateway | 45 |
-| 14:31 | order-svc | Circuit breaker open | 3 |
-
-📊 时间线分析（自动关联）：
-
-14:28 — api-gateway 连接 user-svc 被拒（Connection refused）
-14:29 — user-svc 连接 Redis 超时
-14:30 — api-gateway 开始返回 502（user-svc 不可用）
-14:31 — order-svc 熔断器打开（依赖 user-svc）
-
-🔍 根因链：
-Redis 异常 → user-svc 故障 → api-gateway 502 → order-svc 熔断
-
-💡 排查建议：重点排查 14:28 之前 Redis 发生了什么事。
-需要我查 Redis 的日志吗？
-
----
-用户：查
-
-Bot：
-（Logs Agent 查 Redis 相关日志）
-
-14:26 Redis 日志：
-[WARNING] RDB snapshotting in progress (fork child process)
-[ERROR] Can't save in background: fork: Cannot allocate memory
-
-14:27 Redis 日志：
-[WARNING] maxmemory limit reached (4GB)
-[NOTICE] Evicting keys using allkeys-lru policy
-
-14:28 Redis 日志：
-[ERROR] Connection limit reached (maxclients=10000)
-
-📊 最终诊断：
-1. Redis 内存达到上限 4GB
-2. RDB 持久化 fork 子进程时内存不足
-3. 开始驱逐 Key → CPU 100%
-4. 连接数打满 → user-svc 连不上 → 雪崩
-
-🔧 建议：
-1. 紧急：重启 Redis 恢复服务
-2. 后续：调大 maxmemory 至 8GB
-3. 后续：关闭 RDB 改用 AOF，避免 fork 内存翻倍问题
-```
-
----
-
-## 整体架构总结
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    聊天工具层                              │
-│  Telegram  │  飞书  │  企业微信  │  钉钉  │  API          │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-┌──────────────────────┴───────────────────────────────────┐
-│                OpenClaw Agent 平台                        │
-│                                                          │
-│   ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│   │  多Agent协作  │  │  技能/工作流   │  │  知识库(RAG)  │  │
-│   │  指挥+专业    │  │  巡检/故障/    │  │  文档/复盘/   │  │
-│   │  Agent团队   │  │  扩缩容       │  │  脚本         │  │
-│   └─────────────┘  └──────────────┘  └───────────────┘  │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-┌──────────────────────┴───────────────────────────────────┐
-│                  运维工具集成层                            │
-│                                                          │
-│  Ansible    │  K8s     │  Prometheus │  Loki            │
-│  主机管理   │  容器编排 │  监控告警   │  日志分析         │
-└──────────────────────────────────────────────────────────┘
+□ Gateway 只监听 127.0.0.1，远程访问走 SSH 隧道/Tailscale
+□ 每个通道配 allowFrom 白名单；群场景只挂只读 Agent
+□ Agent 专用系统账号运行，不给 sudo
+□ kubeconfig 用只读 SA；SSH key 对应账号无提权能力
+□ 写操作 Agent 与读操作 Agent 分离，写操作必须人工确认
+□ 凭证不进工作区明文文件（Agent 能读到的东西 = 可能被 prompt 注入骗走的东西）
+□ 会话/命令留痕，定期审计 Agent 执行过什么
+□ 及时跟进官方安全公告并升级（这类"有 shell 的 Agent"是高价值攻击面）
 ```
 
 ---
@@ -998,11 +381,11 @@ Bot：
 ## 快速上手路线
 
 ```
-第 1 步：Docker Compose 部署 OpenClaw（10 分钟）
-第 2 步：接入一个 IM（飞书或企业微信，15 分钟）
-第 3 步：配置一个工具（先接 Ansible，20 分钟）
-第 4 步：跑通第一个场景——"帮我查所有机器状态"
-第 5 步：逐步添加 K8s / Prometheus / Loki
-第 6 步：定义多 Agent 团队协作
-第 7 步：创建定时巡检 Skill
+第 1 步：install.sh 安装 + openclaw onboard（10 分钟）
+第 2 步：接一个 IM 通道（Telegram 最快，国内团队用飞书）
+第 3 步：跳板机上配好只读 kubeconfig + promtool/logcli
+第 4 步：跑通第一个场景——"帮我看下 prod 有没有异常 Pod"
+第 5 步：把巡检流程写成 Skill + cron 定时巡检
+第 6 步：按权限边界拆多 Agent（群只读 / 私聊可写带确认）
+第 7 步：写安全清单并演练一次 prompt 注入攻击，验证边界真的兜得住
 ```

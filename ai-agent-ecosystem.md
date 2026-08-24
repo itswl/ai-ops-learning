@@ -164,17 +164,13 @@ def tool_use_loop(query):
 │  接收告警 → 分配任务 → 汇总报告           │
 └──────────┬──────────────────────────────┘
            │
-    ┌──────┼──────┬──────────┐
-    ↓      ↓      ↓          ↓
-┌──────┐ ┌────┐ ┌──────┐ ┌────────┐
-│诊断   │ │日志 │ │指标   │ │公告    │
-│Agent  │ │Agent│ │Agent  │ │Agent   │
-│       │ │     │ │       │ │        │
-│查事件  │ │查ELK│ │查普罗  │ │写故障   │
-│查Pod   │ │分析 │ │查Go  │ │公告    │
-│状态    │ │报错 │ │rfana │ │通知相关 │
-│       │ │     │ │       │ │人      │
-└──────┘ └────┘ └──────┘ └────────┘
+    ┌──────────┼──────────┬────────────┐
+    ↓          ↓          ↓            ↓
+┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐
+│ 诊断 Agent │ │ 日志 Agent │ │ 指标 Agent    │ │ 公告 Agent │
+│ 查 K8s 事件│ │ 查 ELK    │ │ 查 Prometheus │ │ 写故障公告 │
+│ 查 Pod 状态│ │ 分析报错   │ │ 查 Grafana    │ │ 通知相关人 │
+└──────────┘ └──────────┘ └──────────────┘ └──────────┘
 ```
 
 #### 主流 Multi-Agent 框架
@@ -184,7 +180,8 @@ def tool_use_loop(query):
 | **AutoGen**      | 微软出品，多 Agent 对话式协作 | 企业级多角色协作        |
 | **CrewAI**       | 轻量，角色定义清晰，上手快      | 中小团队快速搭建        |
 | **LangGraph**    | 用图定义 Agent 间流转     | 需要精细控制 Agent 交互 |
-| **OpenAI Swarm** | OpenAI 实验性框架，极简    | 学习和实验           |
+| **OpenAI Agents SDK** | OpenAI 官方（前身是实验性的 Swarm，已停止维护），内置 handoff/guardrails | OpenAI 生态、生产可用 |
+| **Claude Agent SDK** | Anthropic 官方，Claude Code 同款执行环境 | 运维脚本/编码型 Agent |
 | **Dify Agent**   | 低代码拖拽多 Agent       | 非技术人员也能搭        |
 
 #### CrewAI 示例：运维故障响应
@@ -228,14 +225,14 @@ logs_task = Task(
     description="提取 502 错误发生前后 15 分钟的异常日志",
     expected_output="关键日志摘要，按时间线排列",
     agent=logs_agent,
-    depends_on=[diagnose_task],  # 等诊断完成后查日志
+    context=[diagnose_task],  # CrewAI 用 context 传递上游任务输出（没有 depends_on 这个参数）
 )
 
 comm_task = Task(
     description="根据根因和日志分析，撰写故障公告",
     expected_output="故障公告草稿，含影响范围和预计恢复时间",
     agent=comm_agent,
-    depends_on=[diagnose_task, logs_task],
+    context=[diagnose_task, logs_task],
 )
 
 # 3. 组建 Crew
@@ -350,6 +347,9 @@ class OpsAgent:
 
 ```bash
 pip install guardrails-ai
+# hub 里的校验器要先单独安装才能 import：
+guardrails hub install hub://guardrails/toxic_language
+guardrails hub install hub://guardrails/regex_match
 ```
 
 ```python
@@ -477,10 +477,10 @@ model_list:
 
 # 路由规则：简单问题走小模型，复杂问题走大模型
 router_settings:
-  routing_strategy: "cost-based"  # 或 latency-based
-  allowed_fails: 3                # 重试次数
+  routing_strategy: "cost-based-routing"  # 或 latency-based-routing / least-busy
+  allowed_fails: 3                        # 允许失败次数（超过后触发冷却）
   fallbacks:
-    - gpt-4o: deepseek-v3         # GPT 挂了切 DeepSeek
+    - gpt-4o: ["deepseek-v3"]             # GPT 挂了切 DeepSeek（值是列表）
 ```
 
 ```bash
@@ -521,21 +521,20 @@ LiteLLM 给运维的价值：
 ### 4.2 LangFuse 实战
 
 ```bash
-# 自部署
-docker run -d -p 3000:3000 \
-  -e DATABASE_URL=postgresql://... \
-  -e NEXTAUTH_SECRET=mysecret \
-  langfuse/langfuse:latest
+# 自部署：Langfuse v3 起依赖 Postgres + ClickHouse + Redis + S3/MinIO，
+# 不能再用单个 docker run 起（那是 v2 时代的用法），官方推荐 docker compose：
+git clone https://github.com/langfuse/langfuse.git
+cd langfuse
+docker compose up -d
 
 # 访问 http://localhost:3000
 ```
 
 ```python
-# 在 Agent 代码中集成 LangFuse
-from langfuse import Langfuse
-from langfuse.decorators import observe, langfuse_context
+# 在 Agent 代码中集成 LangFuse（Python SDK v3 写法）
+from langfuse import Langfuse, observe, get_client
 
-langfuse = Langfuse(
+Langfuse(
     public_key="pk-xxx",
     secret_key="sk-xxx",
     host="http://localhost:3000",
@@ -546,32 +545,37 @@ langfuse = Langfuse(
 def diagnose_incident(alert: str):
     # LangFuse 自动追踪这个函数的输入、输出、耗时
     result = agent.run(alert)
-    
-    # 记录元数据
-    langfuse_context.update_current_trace(
+
+    # 记录元数据（v3 里通过 get_client() 更新当前 trace，
+    # v2 的 langfuse_context.update_current_trace 已废弃）
+    get_client().update_current_trace(
         tags=["production", "incident"],
         metadata={"alert_type": "502", "severity": "P1"},
     )
-    
+
     return result
 
-# 方式二：手动创建 Span（精细控制）
-trace = langfuse.trace(name="故障排查完整流程")
+# 方式二：手动创建 Span（v3 是 OTel 风格的 context manager）
+langfuse = get_client()
 
-# Span 1: 查询 Prometheus
-span1 = trace.span(name="查询指标", input={"query": "up{job='api'}"})
-metrics = prometheus_client.query("up{job='api'}")
-span1.end(output=metrics)
+with langfuse.start_as_current_span(name="故障排查完整流程"):
+    with langfuse.start_as_current_span(
+        name="查询指标", input={"query": "up{job='api'}"}
+    ) as span:
+        metrics = prometheus_client.query("up{job='api'}")
+        span.update(output=metrics)
 
-# Span 2: 查询日志
-span2 = trace.span(name="查询日志", input={"time_range": "15min"})
-logs = elk_client.search("ERROR", time_range="15min")
-span2.end(output={"log_count": len(logs)})
+    with langfuse.start_as_current_span(
+        name="查询日志", input={"time_range": "15min"}
+    ) as span:
+        logs = elk_client.search("ERROR", time_range="15min")
+        span.update(output={"log_count": len(logs)})
 
-# Span 3: LLM 推理
-span3 = trace.span(name="LLM分析")
-llm_response = llm.chat(f"根据指标 {metrics} 和日志 {logs} 分析根因")
-span3.end(output=llm_response, metadata={"tokens": 1500, "cost": 0.003})
+    with langfuse.start_as_current_generation(name="LLM分析") as gen:
+        llm_response = llm.chat(f"根据指标 {metrics} 和日志 {logs} 分析根因")
+        gen.update(output=llm_response, usage_details={"total": 1500})
+
+langfuse.flush()
 ```
 
 ### LangFuse 能看到什么
@@ -667,7 +671,7 @@ Function Calling：
   LLM JSON 输出：
   {
     "service": "api-gateway",
-    "status": "degradated",
+    "status": "degraded",
     "reason": "P95 延迟从 200ms 升到 2s",
     "evidence": "Prometheus 查询结果: ...",
     "confidence": 0.92
@@ -684,7 +688,7 @@ from pydantic import BaseModel
 # 1. 定义输出结构（Pydantic 模型）
 class IncidentReport(BaseModel):
     service: str
-    status: str          # "healthy" | "degradated" | "down"
+    status: str          # "healthy" | "degraded" | "down"
     severity: str        # "P0" | "P1" | "P2"
     root_cause: str
     affected_services: list[str]
@@ -693,19 +697,22 @@ class IncidentReport(BaseModel):
 
 client = OpenAI()
 
-# 2. 调用时指定 response_format
-response = client.chat.completions.create(
+# 2. 用 SDK 的 parse 接口直接绑定 Pydantic 模型（SDK 会生成正确的 json_schema）
+# 注意：手写 response_format 时结构是
+# {"type":"json_schema","json_schema":{"name":"...","schema":{...},"strict":true}}，
+# 直接把 model_json_schema() 塞进 json_schema 字段是常见错误
+response = client.chat.completions.parse(
     model="qwen3-8b",
     messages=[{
         "role": "user",
         "content": "分析 Prometheus 告警：api-gateway P95 延迟 > 2s"
     }],
-    response_format={"type": "json_schema", "json_schema": IncidentReport.model_json_schema()},
+    response_format=IncidentReport,
 )
-# 输出保证是合法的 IncidentReport JSON
+# 输出保证是合法的 IncidentReport
 
-report = IncidentReport.model_validate_json(response.choices[0].message.content)
-print(report.status)      # "degradated"
+report = response.choices[0].message.parsed
+print(report.status)      # "degraded"
 print(report.confidence)  # 0.92
 # 可以直接写入 CMDB
 ```
@@ -740,10 +747,10 @@ print(report.confidence)  # 0.92
 
 | 模型 | 能力 |
 |---|---|
-| GPT-4o / GPT-4.1 | 图+文输入，综合最强 |
+| GPT-5 系 / GPT-4o | 图+文输入，综合最强 |
 | Claude Sonnet/Opus | 图+文，长图/文档截图识别强 |
-| Gemini 2.5 Pro | 图+文+视频+音频 |
-| Qwen-VL | 国产开源，图文理解 |
+| Gemini 3 Pro | 图+文+视频+音频 |
+| Qwen2.5-VL / Qwen3-VL | 国产开源，图文理解，可自部署 |
 | Llama 4 Scout/Maverick | 开源多模态 |
 
 ### 运维实战：告警截图自动分析
