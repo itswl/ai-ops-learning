@@ -27,6 +27,12 @@
 | [llm-inference-internals.md](llm-inference-internals.md) | 推理系统内部机制（SRE 视角）：调度器与 chunked prefill、KV cache/抢占/前缀缓存、roofline 性能模型、量化 runtime、投机解码、KV 感知路由、PD 分离生态（Dynamo/llm-d/Mooncake） |
 | [gpu-cluster-ops.md](gpu-cluster-ops.md) | GPU 集群运维：软件栈分层排障、Xid/ECC 故障处置手册与自愈流水线、NCCL/IB/RoCE、K8s 调度 2026 版图（DRA GA/MIG/Kueue/KAI）、真实利用率（MFU/MBU）、训练容错与 goodput |
 
+### 可运行原型
+
+| 目录 | 内容 |
+|---|---|
+| [ai-sre-prototype/](ai-sre-prototype/) | 把第八阶段深水区落成能跑的代码：RCA 评估流水线（含"证据不足"样本，演示改坏 prompt→指标下降）+ 五层防御的 L1 修复动作。后端本地 vLLM；零依赖 mock 模式离线可跑 |
+
 ### RAG
 
 | 文件 | 内容 |

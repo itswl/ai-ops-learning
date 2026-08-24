@@ -1,0 +1,12 @@
+# 核心路径零第三方依赖：mock 后端、评估流水线、五层修复动作、单测都只用 Python 标准库。
+# 以下均为可选：
+
+# 打真实 vLLM 时，本项目用 stdlib urllib 直连，连 openai 包都不需要。
+# 若你更习惯用 SDK，可自行安装（本项目不强制）：
+# openai>=1.40
+
+# 接真实 K8s 集群时（RealK8sClient）：
+# kubernetes>=30.1
+
+# 想用 pytest 跑测试（也可直接 python tests/test_remediation.py）：
+# pytest>=8.0
