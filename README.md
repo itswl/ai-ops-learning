@@ -20,6 +20,13 @@
 | [llm-ops-guide.md](llm-ops-guide.md) | 大模型服务运维：GPU/vLLM 监控指标与告警、量化、蒸馏、压测（EvalScope/Locust）、安全 |
 | [llm-fine-tuning-guide.md](llm-fine-tuning-guide.md) | 微调实战：LoRA/QLoRA 原理、数据集制作、超参、LLaMA-Factory 与 Unsloth 全流程 |
 
+### 深水区（进阶）
+
+| 文件 | 内容 |
+|---|---|
+| [llm-inference-internals.md](llm-inference-internals.md) | 推理系统内部机制（SRE 视角）：调度器与 chunked prefill、KV cache/抢占/前缀缓存、roofline 性能模型、量化 runtime、投机解码、KV 感知路由、PD 分离生态（Dynamo/llm-d/Mooncake） |
+| [gpu-cluster-ops.md](gpu-cluster-ops.md) | GPU 集群运维：软件栈分层排障、Xid/ECC 故障处置手册与自愈流水线、NCCL/IB/RoCE、K8s 调度 2026 版图（DRA GA/MIG/Kueue/KAI）、真实利用率（MFU/MBU）、训练容错与 goodput |
+
 ### RAG
 
 | 文件 | 内容 |
@@ -48,6 +55,8 @@ rag-guide → rag-implementation-guide（知识库问答落地）
 functioncalling-mcp-skills → ai-agent-ecosystem（Agent 原理与工程化）
     ↓
 coze-aiops-agent / openclaw-aiops-guide（挑一条路线做出自己的运维智能体）
+    ↓
+llm-inference-internals + gpu-cluster-ops（深水区：从"会用"到"能定量归因"）
 ```
 
 ## 与 cloud-native-ai-sre-roadmap 的关系
