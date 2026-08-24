@@ -319,14 +319,47 @@ QLoRA：
 
 ### 补充：推理框架选型速查
 
-| 框架 | 适用场景 | 硬件要求 | 特点 |
-|---|---|---|---|
-| **Ollama** | 个人/小团队，快速体验 | 单卡，macOS/Linux/Windows | 一条命令部署，GGUF 生态 |
-| **llama.cpp** | CPU/GPU 混合，边缘设备 | 极低，甚至纯 CPU | 灵活性最高，性能极致优化 |
-| **vLLM** | 生产环境 API 服务 | 单卡到多节点集群 | PagedAttention，吞吐最高 |
-| **TGI (Text Generation Inference)** | HuggingFace 生态 | 单卡/多卡 | HuggingFace 官方，易用 |
-| **SGLang** | 复杂 LLM 程序 | 单卡/多卡 | 结构化生成，RadixAttention |
-| **LMDeploy** | 国产，中英双语 | 单卡/多卡，支持昇腾 | TurboMind 引擎，持续批处理 |
-| **TensorRT-LLM** | NVIDIA 深度优化 | NVIDIA GPU | 性能极致，但配置复杂 |
+先破一个常见误区：Ollama、vLLM、SGLang、Dynamo 这些**不在同一个层次**，平铺着比较会选错。它们分三层：
 
-> 运维建议：**开发测试用 Ollama，生产环境用 vLLM**。这是目前最主流且经验证的模式。
+```
+③ 编排层    多实例/多机的路由、KV 管理、弹性、PD 分离
+            NVIDIA Dynamo · llm-d · Ray Serve · KServe
+                    ↑ 架在引擎之上
+② 生产引擎  单实例把数据中心 GPU 榨干：高并发、continuous batching、多卡
+            vLLM · SGLang · TensorRT-LLM · LMDeploy · TGI
+                    ↑ 另一条线，面向多租户吞吐
+① 本地引擎  单人/边缘：一条命令跑起来，CPU/Mac 也能用
+            Ollama · llama.cpp · LM Studio · MLX(mlx-lm)
+```
+
+核心分野：**①优化"一个人零折腾把模型跑起来"，②优化"一堆 GPU 上扛几千并发"。** 两者都暴露 OpenAI 接口、都能当本仓库原型的后端，但为相反目标而生——②的看家本领 continuous batching + PagedAttention 只有在高并发下才划算，单请求场景它不比 llama.cpp 快，还重得多。
+
+#### ① 本地/单人引擎
+
+| 工具 | 底层 | 适用 | 特点 |
+|---|---|---|---|
+| **Ollama** | llama.cpp | 个人/小团队/原型 | 一条命令部署，自带模型仓库，GGUF 生态，跨平台(Mac/Linux/Win) |
+| **llama.cpp** | 自身(C++) | 边缘/CPU/嵌入 | 引擎本体，Ollama/LM Studio 都建在它上；全平台(CPU/Metal/CUDA/Vulkan) |
+| **LM Studio** | llama.cpp(+Mac 上 MLX) | 非技术用户 | 桌面 GUI，点一点就能跑，OpenAI 兼容口 |
+| **MLX / mlx-lm** | Apple MLX | Apple Silicon 原生 | Mac 上最贴硬件的快路子，`mlx_lm.server` 给 OpenAI 口 |
+
+#### ② 生产服务引擎（数据中心 GPU）
+
+| 引擎 | 硬件 | 特点 |
+|---|---|---|
+| **vLLM** | 主力 Linux+NVIDIA(+ROCm/CPU/Metal 插件) | PagedAttention + continuous batching，生态最广，多卡 TP/PP、多机靠 Ray |
+| **SGLang** | 单卡/多卡 | RadixAttention(前缀缓存基数树)，多轮/结构化输出强，DeepSeek 官方部署用它 |
+| **TensorRT-LLM** | NVIDIA 专属 | 把模型**编译**成极致引擎，单机峰值最强，但要按模型/卡型编译，配置复杂 |
+| **LMDeploy** | 单卡/多卡，支持昇腾 | 上海 AI Lab，TurboMind 引擎，国产友好 |
+| **TGI** | 单卡/多卡 | HuggingFace 出品，早期事实标准，现为众选之一 |
+
+#### ③ 编排层（架在引擎之上，不是引擎本身）
+
+| 组件 | 作用 |
+|---|---|
+| **NVIDIA Dynamo** | PD 分离的路由/KV 管理/扩缩容，底下挂 vLLM/SGLang（2026-03 GA） |
+| **llm-d** | K8s 原生分离式推理，vLLM + Inference Gateway（2026 捐 CNCF） |
+| **Ray Serve / KServe** | 通用模型服务编排，把引擎包成可扩缩服务 |
+
+> 三层关系：引擎(②)榨干单实例 GPU → 编排层(③)管多实例/多机的路由与弹性 → 本地引擎(①)是给单人用的另一条线。
+> 运维选型：**本地/开发用 Ollama（Mac 上也可 mlx-lm）；生产单实例用 vLLM 或 SGLang；集群规模大、要 PD 分离才上 Dynamo/llm-d。** 深入的引擎内部机制与 PD 分离见 [llm-inference-internals.md](llm-inference-internals.md)。
